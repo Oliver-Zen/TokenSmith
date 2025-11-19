@@ -34,12 +34,13 @@ def _get_embedder(model_name: str) -> SentenceTransformer:
 
 # -------------------------- Read artifacts -------------------------------
 
-def load_artifacts(artifacts_dir: os.PathLike, index_prefix: str) -> Tuple[faiss.Index, List[str], List[str]]:
+def load_artifacts(artifacts_dir: os.PathLike, index_prefix: str) -> Tuple[faiss.Index, List[str], List[str], List[Dict]]:
     """
     Loads:
       - FAISS index: {index_prefix}.faiss
       - chunks:      {index_prefix}_chunks.pkl
       - sources:     {index_prefix}_sources.pkl
+      - metadata:    {index_prefix}_meta.pkl
     """
     print(f"Loading artifacts from {artifacts_dir} for index prefix {index_prefix}")
     artifacts_dir = pathlib.Path(artifacts_dir)
@@ -47,8 +48,55 @@ def load_artifacts(artifacts_dir: os.PathLike, index_prefix: str) -> Tuple[faiss
     bm25_index  = pickle.load(open(artifacts_dir / f"{index_prefix}_bm25.pkl", "rb"))
     chunks      = pickle.load(open(artifacts_dir / f"{index_prefix}_chunks.pkl", "rb"))
     sources     = pickle.load(open(artifacts_dir / f"{index_prefix}_sources.pkl", "rb"))
+    metadata    = pickle.load(open(artifacts_dir / f"{index_prefix}_meta.pkl", "rb"))
 
-    return faiss_index, bm25_index, chunks, sources
+    return faiss_index, bm25_index, chunks, sources, metadata
+
+
+# -------------------------- Citations formatting -------------------------
+
+def format_citations(chunk_indices: List[int], metadata: List[Dict]) -> str:
+    """
+    Formats citations from chunk indices and metadata.
+
+    Args:
+        chunk_indices: List of chunk indices used in the answer
+        metadata: List of metadata dicts (parallel to chunks)
+
+    Returns:
+        Formatted citations string (e.g., "Sources: §14.1, §14.2")
+    """
+    if not chunk_indices or not metadata:
+        return ""
+
+    import re
+
+    sections = []
+    seen = set()
+
+    for idx in chunk_indices:
+        if idx >= len(metadata):
+            continue
+
+        section_heading = metadata[idx].get("section", "")
+        if not section_heading:
+            continue
+
+        # Extract section number from heading (e.g., "## 14.1 Atomicity" -> "14.1")
+        # Pattern matches: ## <number>.<number>... <rest>
+        match = re.match(r'^##\s*(\d+(?:\.\d+)*)', section_heading)
+        if match:
+            section_num = match.group(1)
+            if section_num not in seen:
+                sections.append(section_num)
+                seen.add(section_num)
+
+    if not sections:
+        return ""
+
+    # Format as compact citations
+    citations = ", ".join(f"§{s}" for s in sections)
+    return f"Sources: {citations}"
 
 
 # -------------------------- Pretty previews -----------------------------

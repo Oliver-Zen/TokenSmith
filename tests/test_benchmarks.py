@@ -199,7 +199,8 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
         disable_chunks=config.get("disable_chunks", False),
         use_golden_chunks=config.get("use_golden_chunks", False),
         output_mode=config.get("output_mode", "html"),
-        metrics=config.get("metrics", ["all"])
+        metrics=config.get("metrics", ["all"]),
+        enable_citations=config.get("enable_citations", False)
     )
     
     # Print status
@@ -215,8 +216,8 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
 
     # Run the query through the main pipeline
     artifacts_dir = cfg.make_artifacts_directory()
-    faiss_index, bm25_index, chunks, sources = load_artifacts(
-        artifacts_dir=artifacts_dir, 
+    faiss_index, bm25_index, chunks, sources, metadata = load_artifacts(
+        artifacts_dir=artifacts_dir,
         index_prefix=config["index_prefix"]
     )
 
@@ -229,11 +230,12 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
         weights=cfg.ranker_weights,
         rrf_k=int(cfg.rrf_k)
     )
-    
+
     # Package artifacts for reuse
     artifacts = {
         "chunks": chunks,
         "sources": sources,
+        "metadata": metadata,
         "retrievers": retrievers,
         "ranker": ranker
     }

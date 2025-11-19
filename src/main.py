@@ -9,7 +9,7 @@ from src.index_builder import build_index
 from src.instrumentation.logging import init_logger, get_logger, RunLogger
 from src.ranking.ranker import EnsembleRanker
 from src.preprocessing.chunking import DocumentChunker
-from src.retriever import apply_seg_filter, BM25Retriever, FAISSRetriever, load_artifacts
+from src.retriever import apply_seg_filter, BM25Retriever, FAISSRetriever, load_artifacts, format_citations
 
 
 def parse_args() -> argparse.Namespace:
@@ -46,7 +46,12 @@ def parse_args() -> argparse.Namespace:
         default="baseline",
         help="system prompt mode (choices: baseline, tutor, concise, detailed)"
     )
-    
+    parser.add_argument(
+        "--citations",
+        action="store_true",
+        help="enable source citations in answers (default: uses config value)"
+    )
+
     # Indexing-specific arguments
     indexing_group = parser.add_argument_group("indexing options")
     indexing_group.add_argument(
@@ -109,15 +114,20 @@ def get_answer(
 ) -> str:
     """
     Run a single query through the pipeline.
-    """    
+    """
     chunks = artifacts["chunks"]
     sources = artifacts["sources"]
+    metadata = artifacts["metadata"]
     retrievers = artifacts["retrievers"]
     ranker = artifacts["ranker"]
-    
+
     logger.log_query_start(question)
-    
+
+    # Determine if citations should be enabled (CLI flag overrides config)
+    enable_citations = args.citations if hasattr(args, 'citations') and args.citations else cfg.enable_citations
+
     # Step 1: Get chunks (golden, retrieved, or none)
+    topk_idxs = []
     if golden_chunks and cfg.use_golden_chunks:
         # Use provided golden chunks
         ranked_chunks = golden_chunks
@@ -131,29 +141,40 @@ def get_answer(
         for retriever in retrievers:
             raw_scores[retriever.name] = retriever.get_scores(question, pool_n, chunks)
         # TODO: Fix retrieval logging.
-        
+
         # Step 2: Ranking
         ordered = ranker.rank(raw_scores=raw_scores)
         topk_idxs = apply_seg_filter(cfg, chunks, ordered)
         logger.log_chunks_used(topk_idxs, chunks, sources)
-        
+
         ranked_chunks = [chunks[i] for i in topk_idxs]
-        
+
         # Step 3: Final Re-ranking (if enabled)
         # Disabled till we fix the core pipeline
         # ranked_chunks = rerank(question, ranked_chunks, mode=cfg.rerank_mode, top_n=cfg.top_k)
-    
+
     # Step 4: Generation
     model_path = args.model_path or cfg.model_path
     system_prompt = args.system_prompt_mode or cfg.system_prompt_mode
+
+    # Generate answer with optional citations
+    if enable_citations and topk_idxs:
+        citations = format_citations(topk_idxs, metadata)
+    else:
+        citations = ""
+
     ans = answer(
-        question, 
-        ranked_chunks, 
-        model_path, 
-        max_tokens=cfg.max_gen_tokens, 
+        question,
+        ranked_chunks,
+        model_path,
+        max_tokens=cfg.max_gen_tokens,
         system_prompt_mode=system_prompt
     )
-    
+
+    # Append citations if available
+    if citations:
+        ans = f"{ans}\n\n{citations}"
+
     return ans
 
 
@@ -170,8 +191,8 @@ def run_chat_session(args: argparse.Namespace, cfg: QueryPlanConfig):
         # Disabled till we fix the core pipeline
         # cfg = planner.plan(q)
         artifacts_dir = cfg.make_artifacts_directory()
-        faiss_index, bm25_index, chunks, sources = load_artifacts(
-            artifacts_dir=artifacts_dir, 
+        faiss_index, bm25_index, chunks, sources, metadata = load_artifacts(
+            artifacts_dir=artifacts_dir,
             index_prefix=args.index_prefix
         )
 
@@ -184,11 +205,12 @@ def run_chat_session(args: argparse.Namespace, cfg: QueryPlanConfig):
             weights=cfg.ranker_weights,
             rrf_k=int(cfg.rrf_k)
         )
-        
+
         # Package artifacts for reuse
         artifacts = {
             "chunks": chunks,
             "sources": sources,
+            "metadata": metadata,
             "retrievers": retrievers,
             "ranker": ranker
         }
