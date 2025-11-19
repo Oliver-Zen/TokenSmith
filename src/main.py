@@ -2,6 +2,7 @@ import argparse
 import pathlib
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Dict, Optional
 
 from src.config import QueryPlanConfig
@@ -61,6 +62,11 @@ def parse_args() -> argparse.Namespace:
         "--stream",
         action="store_true",
         help="enable streaming output for LLM responses (default: uses config value)"
+    )
+    parser.add_argument(
+        "--parallel-retrieval",
+        action="store_true",
+        help="enable parallel execution of FAISS and BM25 retrievers (default: uses config value)"
     )
 
     # Indexing-specific arguments
@@ -134,10 +140,11 @@ def get_answer(
 
     logger.log_query_start(question)
 
-    # Determine if citations, latency logging, and streaming should be enabled (CLI overrides config)
+    # Determine if citations, latency logging, streaming, and parallel retrieval should be enabled (CLI overrides config)
     enable_citations = getattr(args, 'citations', False) or getattr(cfg, 'enable_citations', False)
     enable_latency = getattr(args, 'latency_logging', False) or getattr(cfg, 'enable_latency_logging', False)
     enable_streaming = getattr(args, 'stream', False) or getattr(cfg, 'enable_streaming', False)
+    enable_parallel = getattr(args, 'parallel_retrieval', False) or getattr(cfg, 'enable_parallel_retrieval', True)
 
     # Initialize timing data (only if latency logging is enabled)
     timings = {}
@@ -159,8 +166,23 @@ def get_answer(
 
         pool_n = max(cfg.pool_size, cfg.top_k + 10)
         raw_scores: Dict[str, Dict[int, float]] = {}
-        for retriever in retrievers:
-            raw_scores[retriever.name] = retriever.get_scores(question, pool_n, chunks)
+
+        if enable_parallel and len(retrievers) > 1:
+            # Parallel retrieval: Run FAISS and BM25 concurrently
+            with ThreadPoolExecutor(max_workers=len(retrievers)) as executor:
+                # Submit all retrieval tasks
+                future_to_retriever = {
+                    executor.submit(retriever.get_scores, question, pool_n, chunks): retriever
+                    for retriever in retrievers
+                }
+                # Collect results as they complete
+                for future in as_completed(future_to_retriever):
+                    retriever = future_to_retriever[future]
+                    raw_scores[retriever.name] = future.result()
+        else:
+            # Sequential retrieval: Original behavior
+            for retriever in retrievers:
+                raw_scores[retriever.name] = retriever.get_scores(question, pool_n, chunks)
 
         if enable_latency:
             timings["retrieval_seconds"] = time.perf_counter() - retrieval_start

@@ -47,6 +47,9 @@ class QueryPlanConfig:
     # streaming output
     enable_streaming: bool
 
+    # parallel retrieval
+    enable_parallel_retrieval: bool
+
     # ---------- chunking strategy + artifact name helpers ----------
     def make_strategy(self) -> ChunkStrategy:
         return make_chunk_strategy(config=self.chunk_config)
@@ -98,7 +101,10 @@ class QueryPlanConfig:
             enable_latency_logging = pick("enable_latency_logging", False),
 
             # Streaming output
-            enable_streaming = pick("enable_streaming", False)
+            enable_streaming = pick("enable_streaming", False),
+
+            # Parallel retrieval
+            enable_parallel_retrieval = pick("enable_parallel_retrieval", True)
         )
         cfg._validate()
         return cfg
@@ -144,5 +150,6 @@ class QueryPlanConfig:
             "metrics": self.metrics,
             "enable_citations": self.enable_citations,
             "enable_latency_logging": self.enable_latency_logging,
-            "enable_streaming": self.enable_streaming
+            "enable_streaming": self.enable_streaming,
+            "enable_parallel_retrieval": self.enable_parallel_retrieval
         }
