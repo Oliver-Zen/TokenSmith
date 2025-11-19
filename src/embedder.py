@@ -1,32 +1,38 @@
+import os
 import numpy as np
 from typing import List, Union
 from llama_cpp import Llama
 from tqdm import tqdm
 
+try:
+    from sentence_transformers import SentenceTransformer as HFSTS
+except Exception:
+    HFSTS = None
+
 class SentenceTransformer:
     def __init__(self, model_path: str, n_ctx: int = 40960, n_threads: int = None):
-        """
-        Initialize with a local GGUF model file path.
-        
-        Args:
-            model_path: Path to your local .gguf file
-            n_ctx: Context window size (increased to match Qwen3 training context)
-            n_threads: Number of threads to use (None = auto-detect)
-        """
-        print(f"Loading model with n_ctx={n_ctx}, n_threads={n_threads}")
-        
-        self.model = Llama(
-            model_path=model_path,
-            n_ctx=n_ctx,
-            n_threads=n_threads,
-            embedding=True,
-            verbose=False,
-            n_batch=512,
-            use_mmap=True,
-            logits_all=True
-        )
+        """Use local GGUF if path exists; otherwise use HF sentence-transformers."""
         self._embedding_dimension = None
-        
+        self._backend = "llama" if os.path.exists(model_path) else "hf"
+
+        if self._backend == "llama":
+            print(f"Loading model with n_ctx={n_ctx}, n_threads={n_threads}")
+            self.model = Llama(
+                model_path=model_path,
+                n_ctx=n_ctx,
+                n_threads=n_threads,
+                embedding=True,
+                verbose=False,
+                n_batch=512,
+                use_mmap=True,
+                logits_all=True
+            )
+        else:
+            if HFSTS is None:
+                raise ValueError("sentence-transformers not available; install it or provide a local GGUF path")
+            print(f"Loading HF sentence-transformers model: {model_path}")
+            self.model = HFSTS(model_path)
+
         _ = self.embedding_dimension
         print(f"Model loaded successfully. Embedding dimension: {self._embedding_dimension}")
 
@@ -34,8 +40,12 @@ class SentenceTransformer:
     def embedding_dimension(self) -> int:
         """Get embedding dimension (cached after first call)."""
         if self._embedding_dimension is None:
-            test_embedding = self.model.create_embedding("test")['data'][0]['embedding']
-            self._embedding_dimension = len(test_embedding)
+            if self._backend == "llama":
+                test_embedding = self.model.create_embedding("test")['data'][0]['embedding']
+                self._embedding_dimension = len(test_embedding)
+            else:
+                vec = self.model.encode(["test"])  # (1, D)
+                self._embedding_dimension = int(vec.shape[1])
         return self._embedding_dimension
 
     def encode(self, 
@@ -65,9 +75,9 @@ class SentenceTransformer:
             return np.array([], dtype=np.float32).reshape(0, -1)
         
         print(f"Encoding {len(texts)} texts with batch_size={batch_size}")
-        
+
         embeddings = []
-        
+
         # Process in batches
         num_batches = (len(texts) + batch_size - 1) // batch_size
 
@@ -75,19 +85,25 @@ class SentenceTransformer:
             start_idx = i * batch_size
             end_idx = min((i + 1) * batch_size, len(texts))
             batch_texts = texts[start_idx:end_idx]
-            
-            batch_embeddings = []
-            for text in batch_texts:
+
+            if self._backend == "llama":
+                batch_embeddings = []
+                for text in batch_texts:
+                    try:
+                        embedding = self.model.create_embedding(text)['data'][0]['embedding']
+                        batch_embeddings.append(embedding)
+                    except Exception as e:
+                        print(f"Error encoding text: {e}")
+                        batch_embeddings.append([0.0] * self.embedding_dimension)
+                if len(batch_embeddings) != len(batch_texts):
+                    batch_embeddings.extend([[0.0] * self.embedding_dimension] * (len(batch_texts) - len(batch_embeddings)))
+            else:
                 try:
-                    embedding = self.model.create_embedding(text)['data'][0]['embedding']
-                    batch_embeddings.append(embedding)
+                    batch_embeddings = self.model.encode(batch_texts, show_progress_bar=False)
                 except Exception as e:
-                    print(f"Error encoding text: {e}")
-                    batch_embeddings.append([0.0] * self.embedding_dimension)
-			
-            if len(batch_embeddings) != len(batch_texts):
-                batch_embeddings.extend([[0.0] * self.embedding_dimension] * (len(batch_texts) - len(batch_embeddings)))
-			
+                    print(f"Error encoding batch: {e}")
+                    batch_embeddings = np.zeros((len(batch_texts), self.embedding_dimension), dtype=np.float32)
+
             embeddings.extend(batch_embeddings)
                 
         vecs = np.array(embeddings, dtype=np.float32)
