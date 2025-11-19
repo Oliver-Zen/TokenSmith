@@ -14,6 +14,61 @@ from src.preprocessing.chunking import DocumentChunker
 from src.retriever import apply_seg_filter, BM25Retriever, FAISSRetriever, load_artifacts, format_citations
 
 
+# -------------------------- Query Cache ----------------------------------
+
+class QueryCache:
+    """LRU cache for query results to speed up repeated queries."""
+
+    def __init__(self, max_size: int = 128):
+        self.max_size = max_size
+        self.cache = {}
+        self.access_order = []  # Track access order for LRU
+
+    def _make_key(self, query: str, top_k: int, pool_size: int) -> str:
+        """Create cache key from query and retrieval params."""
+        # Normalize query (lowercase, strip whitespace)
+        normalized_query = query.lower().strip()
+        return f"{normalized_query}|{top_k}|{pool_size}"
+
+    def get(self, query: str, top_k: int, pool_size: int):
+        """Get cached result if available."""
+        key = self._make_key(query, top_k, pool_size)
+        if key in self.cache:
+            # Move to end (most recently used)
+            self.access_order.remove(key)
+            self.access_order.append(key)
+            return self.cache[key]
+        return None
+
+    def put(self, query: str, top_k: int, pool_size: int, result):
+        """Cache a query result."""
+        key = self._make_key(query, top_k, pool_size)
+
+        # Evict least recently used if at capacity
+        if key not in self.cache and len(self.cache) >= self.max_size:
+            lru_key = self.access_order.pop(0)
+            del self.cache[lru_key]
+
+        # Add/update cache
+        if key in self.cache:
+            self.access_order.remove(key)
+        self.cache[key] = result
+        self.access_order.append(key)
+
+    def clear(self):
+        """Clear all cached entries."""
+        self.cache.clear()
+        self.access_order.clear()
+
+    def stats(self):
+        """Get cache statistics."""
+        return {
+            "size": len(self.cache),
+            "max_size": self.max_size,
+            "hit_rate": None  # Could track hits/misses if needed
+        }
+
+
 def parse_args() -> argparse.Namespace:
     """Parse command-line arguments for the application."""
     parser = argparse.ArgumentParser(
@@ -67,6 +122,11 @@ def parse_args() -> argparse.Namespace:
         "--parallel-retrieval",
         action="store_true",
         help="enable parallel execution of FAISS and BM25 retrievers (default: uses config value)"
+    )
+    parser.add_argument(
+        "--query-cache",
+        action="store_true",
+        help="enable LRU caching of query results for faster repeated queries (default: uses config value)"
     )
 
     # Indexing-specific arguments
@@ -127,7 +187,8 @@ def get_answer(
     args: argparse.Namespace,
     logger: "RunLogger",
     artifacts: Optional[Dict] = None,
-    golden_chunks: Optional[list] = None
+    golden_chunks: Optional[list] = None,
+    query_cache: Optional[QueryCache] = None
 ) -> str:
     """
     Run a single query through the pipeline.
@@ -140,11 +201,19 @@ def get_answer(
 
     logger.log_query_start(question)
 
-    # Determine if citations, latency logging, streaming, and parallel retrieval should be enabled (CLI overrides config)
+    # Determine if citations, latency logging, streaming, parallel retrieval, and caching should be enabled (CLI overrides config)
     enable_citations = getattr(args, 'citations', False) or getattr(cfg, 'enable_citations', False)
     enable_latency = getattr(args, 'latency_logging', False) or getattr(cfg, 'enable_latency_logging', False)
     enable_streaming = getattr(args, 'stream', False) or getattr(cfg, 'enable_streaming', False)
     enable_parallel = getattr(args, 'parallel_retrieval', False) or getattr(cfg, 'enable_parallel_retrieval', True)
+    enable_caching = getattr(args, 'query_cache', False) or getattr(cfg, 'enable_query_caching', False)
+
+    # Check cache first (only for non-golden-chunk queries)
+    if enable_caching and query_cache and not golden_chunks:
+        cached_result = query_cache.get(question, cfg.top_k, cfg.pool_size)
+        if cached_result is not None:
+            # Cache hit! Return cached result immediately
+            return cached_result
 
     # Initialize timing data (only if latency logging is enabled)
     timings = {}
@@ -220,6 +289,7 @@ def get_answer(
 
     # Use streaming or non-streaming based on config
     if enable_streaming:
+        # Streaming mode: cannot cache (returns generator)
         # Return a dict with generator and metadata for streaming
         return {
             "streaming": True,
@@ -263,6 +333,10 @@ def get_answer(
                 # Don't let latency logging errors affect the answer
                 print(f"Warning: Failed to log latency: {e}")
 
+        # Cache the result (only for non-golden-chunk, non-streaming queries)
+        if enable_caching and query_cache and not golden_chunks:
+            query_cache.put(question, cfg.top_k, cfg.pool_size, ans)
+
         return ans
 
 
@@ -302,6 +376,14 @@ def run_chat_session(args: argparse.Namespace, cfg: QueryPlanConfig):
             "retrievers": retrievers,
             "ranker": ranker
         }
+
+        # Initialize query cache if enabled
+        enable_caching = getattr(args, 'query_cache', False) or getattr(cfg, 'enable_query_caching', False)
+        query_cache = QueryCache(max_size=getattr(cfg, 'cache_size', 128)) if enable_caching else None
+
+        if enable_caching:
+            print(f"Query caching enabled (max size: {cfg.cache_size})")
+
     except Exception as e:
         print(f"ERROR: Failed to initialize chat artifacts: {e}")
         print("Please ensure you have run 'index' mode first.")
@@ -319,7 +401,7 @@ def run_chat_session(args: argparse.Namespace, cfg: QueryPlanConfig):
                 break
 
             # Use the single query function
-            result = get_answer(q, cfg, args, logger=logger, artifacts=artifacts)
+            result = get_answer(q, cfg, args, logger=logger, artifacts=artifacts, query_cache=query_cache)
 
             print("\n=================== START OF ANSWER ===================")
 

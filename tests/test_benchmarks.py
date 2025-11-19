@@ -203,7 +203,9 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
         enable_citations=config.get("enable_citations", False),
         enable_latency_logging=config.get("enable_latency_logging", False),
         enable_streaming=config.get("enable_streaming", False),
-        enable_parallel_retrieval=config.get("enable_parallel_retrieval", True)
+        enable_parallel_retrieval=config.get("enable_parallel_retrieval", True),
+        enable_query_caching=config.get("enable_query_caching", False),
+        cache_size=config.get("cache_size", 128)
     )
     
     # Print status

@@ -50,6 +50,10 @@ class QueryPlanConfig:
     # parallel retrieval
     enable_parallel_retrieval: bool
 
+    # query caching
+    enable_query_caching: bool
+    cache_size: int
+
     # ---------- chunking strategy + artifact name helpers ----------
     def make_strategy(self) -> ChunkStrategy:
         return make_chunk_strategy(config=self.chunk_config)
@@ -104,7 +108,11 @@ class QueryPlanConfig:
             enable_streaming = pick("enable_streaming", False),
 
             # Parallel retrieval
-            enable_parallel_retrieval = pick("enable_parallel_retrieval", True)
+            enable_parallel_retrieval = pick("enable_parallel_retrieval", True),
+
+            # Query caching
+            enable_query_caching = pick("enable_query_caching", False),
+            cache_size = pick("cache_size", 128)
         )
         cfg._validate()
         return cfg
@@ -151,5 +159,7 @@ class QueryPlanConfig:
             "enable_citations": self.enable_citations,
             "enable_latency_logging": self.enable_latency_logging,
             "enable_streaming": self.enable_streaming,
-            "enable_parallel_retrieval": self.enable_parallel_retrieval
+            "enable_parallel_retrieval": self.enable_parallel_retrieval,
+            "enable_query_caching": self.enable_query_caching,
+            "cache_size": self.cache_size
         }

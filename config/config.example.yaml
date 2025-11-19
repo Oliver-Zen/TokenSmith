@@ -12,3 +12,5 @@ enable_citations: false
 enable_latency_logging: false
 enable_streaming: false
 enable_parallel_retrieval: true
+enable_query_caching: false
+cache_size: 128
