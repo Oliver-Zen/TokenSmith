@@ -1,6 +1,7 @@
 import argparse
 import pathlib
 import sys
+import time
 from typing import Dict, Optional
 
 from src.config import QueryPlanConfig
@@ -50,6 +51,11 @@ def parse_args() -> argparse.Namespace:
         "--citations",
         action="store_true",
         help="enable source citations in answers (default: uses config value)"
+    )
+    parser.add_argument(
+        "--latency-logging",
+        action="store_true",
+        help="enable detailed latency logging for retrieval, ranking, and generation stages (default: uses config value)"
     )
 
     # Indexing-specific arguments
@@ -123,8 +129,14 @@ def get_answer(
 
     logger.log_query_start(question)
 
-    # Determine if citations should be enabled (CLI flag overrides config)
-    enable_citations = args.citations if hasattr(args, 'citations') and args.citations else cfg.enable_citations
+    # Determine if citations and latency logging should be enabled (CLI overrides config)
+    enable_citations = getattr(args, 'citations', False) or getattr(cfg, 'enable_citations', False)
+    enable_latency = getattr(args, 'latency_logging', False) or getattr(cfg, 'enable_latency_logging', False)
+
+    # Initialize timing data (only if latency logging is enabled)
+    timings = {}
+    if enable_latency:
+        overall_start = time.perf_counter()
 
     # Step 1: Get chunks (golden, retrieved, or none)
     topk_idxs = []
@@ -136,16 +148,28 @@ def get_answer(
         ranked_chunks = []
     else:
         # Step 1: Retrieval
+        if enable_latency:
+            retrieval_start = time.perf_counter()
+
         pool_n = max(cfg.pool_size, cfg.top_k + 10)
         raw_scores: Dict[str, Dict[int, float]] = {}
         for retriever in retrievers:
             raw_scores[retriever.name] = retriever.get_scores(question, pool_n, chunks)
+
+        if enable_latency:
+            timings["retrieval_seconds"] = time.perf_counter() - retrieval_start
         # TODO: Fix retrieval logging.
 
         # Step 2: Ranking
+        if enable_latency:
+            ranking_start = time.perf_counter()
+
         ordered = ranker.rank(raw_scores=raw_scores)
         topk_idxs = apply_seg_filter(cfg, chunks, ordered)
         logger.log_chunks_used(topk_idxs, chunks, sources)
+
+        if enable_latency:
+            timings["ranking_seconds"] = time.perf_counter() - ranking_start
 
         ranked_chunks = [chunks[i] for i in topk_idxs]
 
@@ -154,6 +178,9 @@ def get_answer(
         # ranked_chunks = rerank(question, ranked_chunks, mode=cfg.rerank_mode, top_n=cfg.top_k)
 
     # Step 4: Generation
+    if enable_latency:
+        generation_start = time.perf_counter()
+
     model_path = args.model_path or cfg.model_path
     system_prompt = args.system_prompt_mode or cfg.system_prompt_mode
 
@@ -171,9 +198,22 @@ def get_answer(
         system_prompt_mode=system_prompt
     )
 
+    if enable_latency:
+        timings["generation_seconds"] = time.perf_counter() - generation_start
+
     # Append citations if available
     if citations:
         ans = f"{ans}\n\n{citations}"
+
+    # Calculate total time and log if enabled
+    if enable_latency:
+        try:
+            total_time = time.perf_counter() - overall_start
+            timings["total_seconds"] = total_time
+            logger.log_latency(timings)
+        except Exception as e:
+            # Don't let latency logging errors affect the answer
+            print(f"Warning: Failed to log latency: {e}")
 
     return ans
 
@@ -237,6 +277,7 @@ def run_chat_session(args: argparse.Namespace, cfg: QueryPlanConfig):
             print(ans.strip() if ans and ans.strip() else "(No output from model)")
             print("\n==================== END OF ANSWER ====================")
             logger.log_generation(ans, {"max_tokens": cfg.max_gen_tokens, "model_path": args.model_path or cfg.model_path})
+            logger.log_query_complete()
 
         except KeyboardInterrupt:
             print("\nGoodbye!")

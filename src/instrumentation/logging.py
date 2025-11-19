@@ -1,4 +1,5 @@
 import json
+import numpy as np
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional
@@ -178,6 +179,13 @@ class RunLogger:
         }
         self.current_query_data["generation"] = generation_data
 
+    def log_latency(self, timings: Dict[str, float]):
+        """Log latency timings for retrieval, ranking, and generation stages."""
+        if not self.current_query_data:
+            return
+
+        self.current_query_data["latency"] = timings
+
     def log_query_complete(self, total_time_seconds: Optional[float] = None):
         """Finalize and write the current query log."""
         if not self.current_query_data:
@@ -206,7 +214,18 @@ class RunLogger:
     def _write_log(self, data: Dict[str, Any]):
         """Write a log entry to the JSONL file."""
         with open(self.log_file, "a", encoding="utf-8") as f:
-            f.write(json.dumps(data, ensure_ascii=False) + "\n")
+            f.write(json.dumps(data, ensure_ascii=False, default=self._json_serializer) + "\n")
+
+    @staticmethod
+    def _json_serializer(obj):
+        """Custom JSON serializer for objects not serializable by default json code."""
+        if isinstance(obj, (np.integer, np.int64, np.int32)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float64, np.float32)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        raise TypeError(f"Type {type(obj)} not serializable")
 
     def get_session_summary(self) -> Dict[str, Any]:
         """Get summary statistics for the current session."""

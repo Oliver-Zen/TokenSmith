@@ -41,6 +41,9 @@ class QueryPlanConfig:
     # citations
     enable_citations: bool
 
+    # latency logging
+    enable_latency_logging: bool
+
     # ---------- chunking strategy + artifact name helpers ----------
     def make_strategy(self) -> ChunkStrategy:
         return make_chunk_strategy(config=self.chunk_config)
@@ -86,7 +89,10 @@ class QueryPlanConfig:
             metrics        = pick("metrics", ["all"]),
 
             # Citations
-            enable_citations = pick("enable_citations", False)
+            enable_citations = pick("enable_citations", False),
+
+            # Latency logging
+            enable_latency_logging = pick("enable_latency_logging", False)
         )
         cfg._validate()
         return cfg
@@ -130,5 +136,6 @@ class QueryPlanConfig:
             "use_golden_chunks": self.use_golden_chunks,
             "output_mode": self.output_mode,
             "metrics": self.metrics,
-            "enable_citations": self.enable_citations
+            "enable_citations": self.enable_citations,
+            "enable_latency_logging": self.enable_latency_logging
         }

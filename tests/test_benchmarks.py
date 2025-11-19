@@ -200,7 +200,8 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
         use_golden_chunks=config.get("use_golden_chunks", False),
         output_mode=config.get("output_mode", "html"),
         metrics=config.get("metrics", ["all"]),
-        enable_citations=config.get("enable_citations", False)
+        enable_citations=config.get("enable_citations", False),
+        enable_latency_logging=config.get("enable_latency_logging", False)
     )
     
     # Print status

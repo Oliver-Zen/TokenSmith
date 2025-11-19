@@ -9,3 +9,4 @@ seg_filter: null
 chunk_mode : "sections"
 model_path: "models/qwen2.5-1.5b-instruct-q5_k_m.gguf"
 enable_citations: false
+enable_latency_logging: false
