@@ -167,8 +167,79 @@ def _extract_answer(raw: str) -> str:
     text = raw.split(ANSWER_START)[-1]
     return text.split(ANSWER_END)[0].strip()
 
+def run_llama_cpp_streaming(prompt: str, model_path: str, max_tokens: int = 300,
+                            threads: int = 8, n_gpu_layers: int = 8, temperature: float = 0.2):
+    """
+    Stream LLM output token-by-token as a generator.
+
+    Yields:
+        str: Chunks of generated text as they arrive
+    """
+    llama_binary = resolve_llama_binary()
+    cmd = [
+        llama_binary,
+        "-m", model_path,
+        "-p", prompt,
+        "-n", str(max_tokens),
+        "-t", str(threads),
+        "-ngl", str(n_gpu_layers),
+        "--temp", str(temperature),
+        "--top-k", "20",
+        "--top-p", "0.9",
+        "--repeat-penalty", "1.15",
+        "--repeat-last-n", "256",
+        "-no-cnv",
+        "-r", ANSWER_END,
+    ]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,  # Line buffered
+        env={**os.environ, "GGML_LOG_LEVEL": "ERROR", "LLAMA_LOG_LEVEL": "ERROR"},
+    )
+
+    # State machine for parsing streaming output
+    state = "BEFORE_ANSWER"
+    buffer = ""
+
+    try:
+        for line in iter(proc.stdout.readline, ''):
+            if not line:
+                break
+
+            buffer += line
+
+            # Look for start marker
+            if state == "BEFORE_ANSWER":
+                if ANSWER_START in buffer:
+                    state = "IN_ANSWER"
+                    # Extract everything after the start marker
+                    _, buffer = buffer.split(ANSWER_START, 1)
+
+            # Stream content between markers
+            if state == "IN_ANSWER":
+                if ANSWER_END in buffer:
+                    # Found end marker - yield final chunk and stop
+                    final_chunk, _ = buffer.split(ANSWER_END, 1)
+                    if final_chunk:
+                        yield final_chunk
+                    break
+                else:
+                    # Yield current buffer and continue
+                    if buffer:
+                        yield buffer
+                        buffer = ""
+    finally:
+        proc.stdout.close()
+        proc.wait()
+
+
 def run_llama_cpp(prompt: str, model_path: str, max_tokens: int = 300,
                   threads: int = 8, n_gpu_layers: int = 8, temperature: float = 0.2):
+    """Non-streaming version - collects all output at once."""
     llama_binary = resolve_llama_binary()
     cmd = [
         llama_binary,
@@ -210,8 +281,23 @@ def _dedupe_sentences(text: str) -> str:
             cleaned.append(s)
     return " ".join(cleaned)
 
+def answer_streaming(query: str, chunks, model_path: str, max_tokens: int = 300,
+                     system_prompt_mode: str = "tutor", **kw):
+    """
+    Streaming version of answer - yields chunks as they're generated.
+
+    Yields:
+        str: Chunks of the answer as they arrive
+    """
+    prompt = format_prompt(chunks, query, system_prompt_mode=system_prompt_mode)
+
+    for chunk in run_llama_cpp_streaming(prompt, model_path, max_tokens=max_tokens, **kw):
+        yield chunk
+
+
 def answer(query: str, chunks, model_path: str, max_tokens: int = 300,
            system_prompt_mode: str = "tutor", **kw):
+    """Non-streaming version - returns complete answer."""
     prompt = format_prompt(chunks, query, system_prompt_mode=system_prompt_mode)
     raw = run_llama_cpp(prompt, model_path, max_tokens=max_tokens, **kw)
     return _dedupe_sentences(raw)

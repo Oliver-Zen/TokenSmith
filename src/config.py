@@ -44,6 +44,9 @@ class QueryPlanConfig:
     # latency logging
     enable_latency_logging: bool
 
+    # streaming output
+    enable_streaming: bool
+
     # ---------- chunking strategy + artifact name helpers ----------
     def make_strategy(self) -> ChunkStrategy:
         return make_chunk_strategy(config=self.chunk_config)
@@ -92,7 +95,10 @@ class QueryPlanConfig:
             enable_citations = pick("enable_citations", False),
 
             # Latency logging
-            enable_latency_logging = pick("enable_latency_logging", False)
+            enable_latency_logging = pick("enable_latency_logging", False),
+
+            # Streaming output
+            enable_streaming = pick("enable_streaming", False)
         )
         cfg._validate()
         return cfg
@@ -137,5 +143,6 @@ class QueryPlanConfig:
             "output_mode": self.output_mode,
             "metrics": self.metrics,
             "enable_citations": self.enable_citations,
-            "enable_latency_logging": self.enable_latency_logging
+            "enable_latency_logging": self.enable_latency_logging,
+            "enable_streaming": self.enable_streaming
         }

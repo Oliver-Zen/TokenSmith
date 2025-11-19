@@ -5,7 +5,7 @@ import time
 from typing import Dict, Optional
 
 from src.config import QueryPlanConfig
-from src.generator import answer
+from src.generator import answer, answer_streaming
 from src.index_builder import build_index
 from src.instrumentation.logging import init_logger, get_logger, RunLogger
 from src.ranking.ranker import EnsembleRanker
@@ -56,6 +56,11 @@ def parse_args() -> argparse.Namespace:
         "--latency-logging",
         action="store_true",
         help="enable detailed latency logging for retrieval, ranking, and generation stages (default: uses config value)"
+    )
+    parser.add_argument(
+        "--stream",
+        action="store_true",
+        help="enable streaming output for LLM responses (default: uses config value)"
     )
 
     # Indexing-specific arguments
@@ -129,9 +134,10 @@ def get_answer(
 
     logger.log_query_start(question)
 
-    # Determine if citations and latency logging should be enabled (CLI overrides config)
+    # Determine if citations, latency logging, and streaming should be enabled (CLI overrides config)
     enable_citations = getattr(args, 'citations', False) or getattr(cfg, 'enable_citations', False)
     enable_latency = getattr(args, 'latency_logging', False) or getattr(cfg, 'enable_latency_logging', False)
+    enable_streaming = getattr(args, 'stream', False) or getattr(cfg, 'enable_streaming', False)
 
     # Initialize timing data (only if latency logging is enabled)
     timings = {}
@@ -190,32 +196,52 @@ def get_answer(
     else:
         citations = ""
 
-    ans = answer(
-        question,
-        ranked_chunks,
-        model_path,
-        max_tokens=cfg.max_gen_tokens,
-        system_prompt_mode=system_prompt
-    )
+    # Use streaming or non-streaming based on config
+    if enable_streaming:
+        # Return a dict with generator and metadata for streaming
+        return {
+            "streaming": True,
+            "generator": answer_streaming(
+                question,
+                ranked_chunks,
+                model_path,
+                max_tokens=cfg.max_gen_tokens,
+                system_prompt_mode=system_prompt
+            ),
+            "citations": citations,
+            "timings": timings,
+            "enable_latency": enable_latency,
+            "overall_start": overall_start if enable_latency else None,
+            "logger": logger
+        }
+    else:
+        # Non-streaming: return complete answer as string
+        ans = answer(
+            question,
+            ranked_chunks,
+            model_path,
+            max_tokens=cfg.max_gen_tokens,
+            system_prompt_mode=system_prompt
+        )
 
-    if enable_latency:
-        timings["generation_seconds"] = time.perf_counter() - generation_start
+        if enable_latency:
+            timings["generation_seconds"] = time.perf_counter() - generation_start
 
-    # Append citations if available
-    if citations:
-        ans = f"{ans}\n\n{citations}"
+        # Append citations if available
+        if citations:
+            ans = f"{ans}\n\n{citations}"
 
-    # Calculate total time and log if enabled
-    if enable_latency:
-        try:
-            total_time = time.perf_counter() - overall_start
-            timings["total_seconds"] = total_time
-            logger.log_latency(timings)
-        except Exception as e:
-            # Don't let latency logging errors affect the answer
-            print(f"Warning: Failed to log latency: {e}")
+        # Calculate total time and log if enabled
+        if enable_latency:
+            try:
+                total_time = time.perf_counter() - overall_start
+                timings["total_seconds"] = total_time
+                logger.log_latency(timings)
+            except Exception as e:
+                # Don't let latency logging errors affect the answer
+                print(f"Warning: Failed to log latency: {e}")
 
-    return ans
+        return ans
 
 
 def run_chat_session(args: argparse.Namespace, cfg: QueryPlanConfig):
@@ -271,10 +297,43 @@ def run_chat_session(args: argparse.Namespace, cfg: QueryPlanConfig):
                 break
 
             # Use the single query function
-            ans = get_answer(q, cfg, args, logger=logger,artifacts=artifacts)
+            result = get_answer(q, cfg, args, logger=logger, artifacts=artifacts)
 
             print("\n=================== START OF ANSWER ===================")
-            print(ans.strip() if ans and ans.strip() else "(No output from model)")
+
+            # Handle streaming vs non-streaming responses
+            if isinstance(result, dict) and result.get("streaming"):
+                # Streaming mode: print chunks as they arrive
+                full_answer = ""
+                for chunk in result["generator"]:
+                    print(chunk, end='', flush=True)
+                    full_answer += chunk
+
+                # Add citations if available
+                if result["citations"]:
+                    citations_text = f"\n\n{result['citations']}"
+                    print(citations_text, end='', flush=True)
+                    full_answer += citations_text
+
+                print()  # Final newline
+
+                # Handle latency logging for streaming
+                if result["enable_latency"]:
+                    try:
+                        generation_time = time.perf_counter() - (result["overall_start"] + result["timings"].get("retrieval_seconds", 0) + result["timings"].get("ranking_seconds", 0))
+                        result["timings"]["generation_seconds"] = generation_time
+                        total_time = time.perf_counter() - result["overall_start"]
+                        result["timings"]["total_seconds"] = total_time
+                        result["logger"].log_latency(result["timings"])
+                    except Exception as e:
+                        print(f"Warning: Failed to log latency: {e}")
+
+                ans = full_answer
+            else:
+                # Non-streaming mode: print complete answer
+                ans = result
+                print(ans.strip() if ans and ans.strip() else "(No output from model)")
+
             print("\n==================== END OF ANSWER ====================")
             logger.log_generation(ans, {"max_tokens": cfg.max_gen_tokens, "model_path": args.model_path or cfg.model_path})
             logger.log_query_complete()
