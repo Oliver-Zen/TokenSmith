@@ -3,6 +3,7 @@ from llama_cpp import Llama
 
 ANSWER_START = "<<<ANSWER>>>"
 ANSWER_END   = "<<<END>>>"
+DEFAULT_GEN_N_CTX = 8192
 
 def text_cleaning(prompt):
     _CONTROL_CHARS_RE = re.compile(r'[\u0000-\u001F\u007F-\u009F]')
@@ -60,6 +61,44 @@ def get_system_prompt(mode="tutor"):
     
     return prompts.get(mode)
 
+def _normalize_chunks(chunks, max_chunk_chars=400):
+    normalized = []
+    for chunk in chunks or []:
+        text = chunk[0] if isinstance(chunk, tuple) else chunk
+        text = text_cleaning(text)
+        if max_chunk_chars and len(text) > max_chunk_chars:
+            text = text[:max_chunk_chars].rsplit(" ", 1)[0].strip() + " ..."
+        normalized.append(text)
+    return normalized
+
+
+def fit_chunks_to_context(
+    query,
+    chunks,
+    model_path,
+    max_tokens,
+    system_prompt_mode="tutor",
+    max_chunk_chars=400,
+    n_ctx=DEFAULT_GEN_N_CTX,
+):
+    normalized_chunks = _normalize_chunks(chunks, max_chunk_chars=max_chunk_chars)
+    model = get_llama_model(model_path, n_ctx=n_ctx)
+    reserved_completion_tokens = max(max_tokens, 256)
+
+    for chunk_count in range(len(normalized_chunks), -1, -1):
+        candidate_chunks = normalized_chunks[:chunk_count]
+        prompt = format_prompt(
+            candidate_chunks,
+            query,
+            max_chunk_chars=max_chunk_chars,
+            system_prompt_mode=system_prompt_mode,
+        )
+        prompt_tokens = model.tokenize(prompt.encode("utf-8"))
+        if len(prompt_tokens) + reserved_completion_tokens <= n_ctx:
+            return candidate_chunks, prompt
+
+    return [], format_prompt([], query, system_prompt_mode=system_prompt_mode)
+
 
 def format_prompt(chunks, query, max_chunk_chars=400, system_prompt_mode="tutor"):
     """
@@ -77,8 +116,7 @@ def format_prompt(chunks, query, max_chunk_chars=400, system_prompt_mode="tutor"
     
     # Build prompt based on whether chunks are provided
     if chunks and len(chunks) > 0:
-        if isinstance(chunks[0], tuple):
-            chunks = [c[0] for c in chunks]
+        chunks = _normalize_chunks(chunks, max_chunk_chars=max_chunk_chars)
         context = "\n\n".join(chunks)
         context = text_cleaning(context)
         
@@ -110,27 +148,28 @@ def format_prompt(chunks, query, max_chunk_chars=400, system_prompt_mode="tutor"
 
 _LLM_CACHE = {}
 
-def get_llama_model(model_path: str, n_ctx: int = 4096):
-    if model_path not in _LLM_CACHE:
+def get_llama_model(model_path: str, n_ctx: int = DEFAULT_GEN_N_CTX):
+    cache_key = (model_path, n_ctx)
+    if cache_key not in _LLM_CACHE:
         try:
-            _LLM_CACHE[model_path] = Llama(model_path=model_path,
-                                       n_ctx=n_ctx,
-                                       verbose=False,
-                                       n_gpu_layers=-1)
+            _LLM_CACHE[cache_key] = Llama(model_path=model_path,
+                                          n_ctx=n_ctx,
+                                          verbose=False,
+                                          n_gpu_layers=-1)
         except Exception as e:
             print(f"Error loading LLaMA model from {model_path} on GPU: {e}")
-            _LLM_CACHE[model_path] = Llama(model_path=model_path,
-                                       n_ctx=n_ctx,
-                                       verbose=False)
-    return _LLM_CACHE[model_path]
+            _LLM_CACHE[cache_key] = Llama(model_path=model_path,
+                                          n_ctx=n_ctx,
+                                          verbose=False)
+    return _LLM_CACHE[cache_key]
 
-def stream_llama_cpp(prompt: str, model_path: str, max_tokens: int, temperature: float):
+def stream_llama_cpp(prompt: str, model_path: str, max_tokens: int, temperature: float, n_ctx: int = DEFAULT_GEN_N_CTX):
     """
     Generator that yields incremental text chunks until ANSWER_END or token limit.
     Usage:
         for delta in stream_llama_cpp(...): print(delta, end="", flush=True)
     """
-    model : Llama = get_llama_model(model_path)
+    model : Llama = get_llama_model(model_path, n_ctx=n_ctx)
     for ev in model.create_completion(
         prompt,
         max_tokens=max_tokens,
@@ -141,8 +180,8 @@ def stream_llama_cpp(prompt: str, model_path: str, max_tokens: int, temperature:
         delta = ev["choices"][0]["text"]
         yield delta
 
-def run_llama_cpp(prompt: str, model_path: str, max_tokens: int, temperature: float):
-    model: Llama = get_llama_model(model_path)
+def run_llama_cpp(prompt: str, model_path: str, max_tokens: int, temperature: float, n_ctx: int = DEFAULT_GEN_N_CTX):
+    model: Llama = get_llama_model(model_path, n_ctx=n_ctx)
     return model.create_completion(
         prompt,
         max_tokens=max_tokens,
@@ -151,8 +190,15 @@ def run_llama_cpp(prompt: str, model_path: str, max_tokens: int, temperature: fl
     )
 
 def answer(query: str, chunks, model_path: str, max_tokens: int = 300, system_prompt_mode: str = "tutor", temperature: float = 0.2):
-    prompt = format_prompt(chunks, query, system_prompt_mode=system_prompt_mode)
-    return stream_llama_cpp(prompt, model_path, max_tokens=max_tokens, temperature=temperature)
+    fitted_chunks, prompt = fit_chunks_to_context(
+        query,
+        chunks,
+        model_path,
+        max_tokens=max_tokens,
+        system_prompt_mode=system_prompt_mode,
+        n_ctx=DEFAULT_GEN_N_CTX,
+    )
+    return stream_llama_cpp(prompt, model_path, max_tokens=max_tokens, temperature=temperature, n_ctx=DEFAULT_GEN_N_CTX)
 
 def double_answer(query: str, chunks, model_path: str,
                   max_tokens: int = 300,
@@ -160,17 +206,21 @@ def double_answer(query: str, chunks, model_path: str,
                   temperature: float = 0.2):
 
     # ---- Pass 1 ----
-    base_prompt = format_prompt(
-        chunks,
+    _, base_prompt = fit_chunks_to_context(
         query,
-        system_prompt_mode=system_prompt_mode
+        chunks,
+        model_path,
+        max_tokens=max_tokens,
+        system_prompt_mode=system_prompt_mode,
+        n_ctx=DEFAULT_GEN_N_CTX,
     )
 
     initial_stream = stream_llama_cpp(
         base_prompt,
         model_path,
         max_tokens,
-        temperature
+        temperature,
+        n_ctx=DEFAULT_GEN_N_CTX,
     )
 
     initial_response = "".join(initial_stream)
@@ -193,7 +243,8 @@ def double_answer(query: str, chunks, model_path: str,
         repeated_prompt,
         model_path,
         max_tokens,
-        temperature
+        temperature,
+        n_ctx=DEFAULT_GEN_N_CTX,
     )
 
 def dedupe_generated_text(text: str) -> str:
@@ -211,4 +262,7 @@ def dedupe_generated_text(text: str) -> str:
             continue
         cleaned.append(line)
         prev = normalized
-    return "\n".join(cleaned)
+    deduped = "\n".join(cleaned)
+    for marker in (ANSWER_START, ANSWER_END, "<<<ENDANSWER>>>"):
+        deduped = deduped.replace(marker, "")
+    return deduped.strip()

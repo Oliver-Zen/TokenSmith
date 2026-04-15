@@ -5,13 +5,10 @@ Provides REST API endpoints for the React frontend.
 
 import sys
 import pathlib
-import re, json
 import traceback
 from copy import deepcopy
 from contextlib import asynccontextmanager
 from typing import Dict, List, Optional
-import traceback
-import os
 
 # Add project root to Python path to allow imports when run directly
 _project_root = pathlib.Path(__file__).resolve().parent.parent
@@ -26,8 +23,9 @@ from pydantic import BaseModel
 from src.config import RAGConfig
 from src.generator import answer
 from src.instrumentation.logging import get_logger
+from src.main import build_query_planner, resolve_query_config, retrieve_and_rank_chunks
 from src.ranking.ranker import EnsembleRanker
-from src.retriever import filter_retrieved_chunks, BM25Retriever, FAISSRetriever, IndexKeywordRetriever, get_page_numbers, load_artifacts
+from src.retriever import get_page_numbers, load_artifacts
 
 # Constants
 INDEX_PREFIX = "textbook_index"
@@ -38,6 +36,7 @@ _artifacts: Optional[Dict[str, List[str]]] = None
 _retrievers: Optional[List] = None
 _ranker: Optional[EnsembleRanker] = None
 _config: Optional[RAGConfig] = None
+_planner = None
 _logger = None
 
 
@@ -72,14 +71,31 @@ def _resolve_config_path() -> pathlib.Path:
 
 
 def _ensure_initialized():
-    if not all([_config, _artifacts, _retrievers, _ranker]):
+    if not all([_config, _artifacts]):
         raise HTTPException(
             status_code=503,
             detail="Artifacts not loaded. Please run indexing first."
         )
 
+def _copy_cfg_with_updates(cfg, **updates):
+    if hasattr(cfg, "with_updates"):
+        return cfg.with_updates(**updates)
+
+    cfg_copy = deepcopy(cfg)
+    for key, value in updates.items():
+        setattr(cfg_copy, key, value)
+    return cfg_copy
+
+
+def _effective_query_config(query: str, top_k: Optional[int] = None):
+    effective_cfg, planner_info = resolve_query_config(query, _config, _planner)
+    if top_k is not None:
+        effective_cfg = _copy_cfg_with_updates(effective_cfg, top_k=top_k)
+    return effective_cfg, planner_info
+
+
 def _create_log(chunks , sources , topk_idxs, ordered_ranked_scores, page_nums, full_response_accumulator, request,
-                 enable_chunks, prompt_type, max_chunks, temperature):
+                 enable_chunks, prompt_type, max_chunks, temperature, cfg, additional_log_info=None):
     try:
         # Capture the actual strings used for the log file
         log_chunks = [chunks[i] for i in topk_idxs[:max_chunks]]
@@ -88,7 +104,7 @@ def _create_log(chunks , sources , topk_idxs, ordered_ranked_scores, page_nums, 
         # Just Logging
         _logger.save_chat_log(
             query=request.query,
-            config_state=_config.get_config_state(),
+            config_state=cfg.get_config_state(),
             ordered_scores=ordered_ranked_scores,
             chat_request_params={
                 "enable_chunks": {
@@ -113,7 +129,8 @@ def _create_log(chunks , sources , topk_idxs, ordered_ranked_scores, page_nums, 
             sources=log_sources,
             page_map=page_nums,
             full_response="".join(full_response_accumulator),
-            top_k=max_chunks
+            top_k=max_chunks,
+            additional_log_info=additional_log_info,
         )
 
         return True
@@ -121,36 +138,40 @@ def _create_log(chunks , sources , topk_idxs, ordered_ranked_scores, page_nums, 
     except Exception as log_exc:
         return False
 
-def _retrieve_and_rank(query: str, top_k: Optional[int] = None):
+def _retrieve_and_rank(query: str, cfg):
     chunks = _artifacts["chunks"]
-    effective_top_k = top_k if top_k is not None else _config.top_k
-    pool_n = max(_config.num_candidates, effective_top_k + 10)
+    if _artifacts.get("faiss_index") is not None and _artifacts.get("bm25_index") is not None:
+        ranked_chunks, topk_idxs, ordered_scores, _, _ = retrieve_and_rank_chunks(
+            question=query,
+            cfg=cfg,
+            artifacts=_artifacts,
+            is_test_mode=False,
+        )
+        return ranked_chunks, topk_idxs, ordered_scores
+
+    effective_top_k = cfg.top_k
+    pool_n = max(cfg.num_candidates, effective_top_k + 10)
     raw_scores: Dict[str, Dict[int, float]] = {}
 
     for retriever in _retrievers:
         raw_scores[retriever.name] = retriever.get_scores(query, pool_n, chunks)
 
     ordered_ids, ordered_scores = _ranker.rank(raw_scores=raw_scores)
-
-    if top_k is not None:
-        ordered_ids = ordered_ids[:top_k]
-        ordered_scores = ordered_scores[:top_k]
-    else:
-        ordered_ids = ordered_ids[:_config.top_k]
-        ordered_scores = ordered_scores[:_config.top_k]
-
-    return ordered_ids, ordered_scores
+    topk_idxs = ordered_ids[:effective_top_k]
+    ranked_chunks = [chunks[i] for i in topk_idxs]
+    return ranked_chunks, topk_idxs, ordered_scores[:effective_top_k]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Initialize artifacts on startup."""
-    global _artifacts, _retrievers, _ranker, _config, _logger
+    global _artifacts, _retrievers, _ranker, _config, _planner, _logger
 
     config_path = _resolve_config_path()
     if not config_path.exists():
         raise FileNotFoundError(f"No config file found at {config_path}")
 
     _config = RAGConfig.from_yaml(config_path)    
+    _planner = build_query_planner(_config)
     _logger = get_logger()
 
     try:
@@ -161,27 +182,12 @@ async def lifespan(app: FastAPI):
         )
 
         _artifacts = {
+            "faiss_index": faiss_index,
+            "bm25_index": bm25_index,
             "chunks": chunks,
             "sources": sources,
             "meta": metadata,
         }
-
-        _retrievers = [
-            FAISSRetriever(faiss_index, _config.embed_model),
-            BM25Retriever(bm25_index),
-        ]
-        
-        # Add index keyword retriever if weight > 0
-        if _config.ranker_weights.get("index_keywords", 0) > 0:
-            _retrievers.append(
-                IndexKeywordRetriever(_config.extracted_index_path, _config.page_to_chunk_map_path)
-            )
-
-        _ranker = EnsembleRanker(
-            ensemble_method=_config.ensemble_method,
-            weights=_config.ranker_weights,
-            rrf_k=int(_config.rrf_k),
-        )
 
         print("TokenSmith API initialized successfully")
     except Exception as exc:
@@ -249,6 +255,7 @@ async def test_chat(request: ChatRequest):
         if request.top_k is not None
         else (request.max_chunks if request.max_chunks is not None else _config.top_k)
     )
+    effective_cfg, planner_info = _effective_query_config(request.query, top_k=max_chunks)
 
     if disable_chunks:
         return {
@@ -258,17 +265,13 @@ async def test_chat(request: ChatRequest):
 
     try:
         # ✅ Correct order (matches /api/chat)
-        topk_idxs, ordered_ranked_scores = _retrieve_and_rank(
-            request.query, top_k=max_chunks
+        ranked_chunks, topk_idxs, ordered_ranked_scores = _retrieve_and_rank(
+            request.query, cfg=effective_cfg
         )
 
         # Ensure safe types
         topk_idxs = [int(i) for i in (topk_idxs or [])]
         ordered_ranked_scores = ordered_ranked_scores or {}
-
-        ranked_chunks = [
-            _artifacts["chunks"][i] for i in topk_idxs[:max_chunks]
-        ]
 
         return {
             "status": "success",
@@ -277,6 +280,7 @@ async def test_chat(request: ChatRequest):
             "top_chunks": ranked_chunks[:3],
             "raw_scores": ordered_ranked_scores,
             "top_idxs": topk_idxs,
+            "planner": planner_info,
             "message": "Retrieval and ranking successful, generation skipped",
         }
 
@@ -301,18 +305,19 @@ async def chat_stream(request: ChatRequest):
     prompt_type = request.prompt_type if request.prompt_type is not None else _config.system_prompt_mode
     max_chunks = request.top_k if request.top_k is not None else (request.max_chunks if request.max_chunks is not None else _config.top_k)
     temperature = request.temperature if request.temperature is not None else 0.7
+    effective_cfg, planner_info = _effective_query_config(request.query, top_k=max_chunks)
     
     chunks = _artifacts["chunks"]
     sources = _artifacts["sources"]
     
     if disable_chunks:
         ranked_chunks, topk_idxs = [], []
+        ordered_ranked_scores = []
     else:
-        topk_idxs, ordered_ranked_scores = _retrieve_and_rank(request.query, top_k=max_chunks)
+        ranked_chunks, topk_idxs, ordered_ranked_scores = _retrieve_and_rank(request.query, cfg=effective_cfg)
         topk_idxs = [int(i) for i in topk_idxs]
-        ranked_chunks = [chunks[i] for i in topk_idxs[:max_chunks]]
     
-    if not _config.gen_model:
+    if not effective_cfg.gen_model:
         raise HTTPException(status_code=500, detail="Model path not configured.")
 
     # Streaming generator function
@@ -334,17 +339,19 @@ async def chat_stream(request: ChatRequest):
             
             yield f"data: {json.dumps({'type': 'sources', 'content': [s.dict() for s in sources_used]})}\n\n"
             yield f"data: {json.dumps({'type': 'chunks_by_page', 'content': chunks_by_page})}\n\n"
+            if planner_info:
+                yield f"data: {json.dumps({'type': 'planner', 'content': planner_info})}\n\n"
 
             # Stream generation token by token
-            for delta in answer(request.query, ranked_chunks, _config.gen_model,
-                              _config.max_gen_tokens, system_prompt_mode=prompt_type, temperature=temperature):
+            for delta in answer(request.query, ranked_chunks, effective_cfg.gen_model,
+                              effective_cfg.max_gen_tokens, system_prompt_mode=prompt_type, temperature=temperature):
                 if delta:
                     full_response_accumulator.append(delta) # Capture for log
                     yield f"data: {json.dumps({'type': 'token', 'content': delta})}\n\n"
             
             if _logger:
                 success_log = _create_log(chunks , sources , topk_idxs, ordered_ranked_scores, page_nums, full_response_accumulator, request,
-                            enable_chunks, prompt_type, max_chunks, temperature)
+                            enable_chunks, prompt_type, max_chunks, temperature, effective_cfg, additional_log_info=planner_info)
                 if not success_log:
                     print("Logging failed for this request.")
 
@@ -388,6 +395,7 @@ async def chat(request: ChatRequest):
         )
     )
     temperature = request.temperature if request.temperature is not None else 0.7
+    effective_cfg, planner_info = _effective_query_config(request.query, top_k=max_chunks)
 
     chunks = _artifacts["chunks"]
     sources = _artifacts["sources"]
@@ -398,25 +406,23 @@ async def chat(request: ChatRequest):
             ranked_chunks, topk_idxs, ordered_ranked_scores = [], [], {}
         else:
             retrieval_result = _retrieve_and_rank(
-                request.query, top_k=max_chunks
+                request.query, cfg=effective_cfg
             )
 
             # 🔒 Safe unpacking for unit tests where ranker is mocked
             if (
                 not retrieval_result
                 or not isinstance(retrieval_result, (list, tuple))
-                or len(retrieval_result) != 2
+                or len(retrieval_result) != 3
             ):
-                topk_idxs, ordered_ranked_scores = [], {}
+                ranked_chunks, topk_idxs, ordered_ranked_scores = [], [], {}
             else:
-                topk_idxs, ordered_ranked_scores = retrieval_result
+                ranked_chunks, topk_idxs, ordered_ranked_scores = retrieval_result
 
             topk_idxs = [int(i) for i in (topk_idxs or [])]
             ordered_ranked_scores = ordered_ranked_scores or {}
 
-            ranked_chunks = [chunks[i] for i in topk_idxs[:max_chunks]]
-
-        if not _config.gen_model:
+        if not effective_cfg.gen_model:
             raise HTTPException(status_code=500, detail="Model path not configured.")
 
         # 3. Full Generation
@@ -425,8 +431,8 @@ async def chat(request: ChatRequest):
                 answer(
                     request.query,
                     ranked_chunks,
-                    _config.gen_model,
-                    _config.max_gen_tokens,
+                    effective_cfg.gen_model,
+                    effective_cfg.max_gen_tokens,
                     system_prompt_mode=prompt_type,
                     temperature=temperature,
                 )
@@ -472,6 +478,8 @@ async def chat(request: ChatRequest):
                 prompt_type,
                 max_chunks,
                 temperature,
+                effective_cfg,
+                additional_log_info=planner_info,
             )
             if not success_log:
                 print("Logging failed for this request.")

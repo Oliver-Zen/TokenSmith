@@ -15,6 +15,7 @@ from src.config import RAGConfig
 from src.generator import answer, double_answer, dedupe_generated_text
 from src.index_builder import build_index
 from src.instrumentation.logging import get_logger
+from src.planning.heuristics import HeuristicQueryPlanner
 from src.ranking.ranker import EnsembleRanker
 from src.preprocessing.chunking import DocumentChunker
 from src.query_enhancement import generate_hypothetical_document, contextualize_query
@@ -29,6 +30,131 @@ from src.retriever import (
 from src.ranking.reranker import rerank
 
 ANSWER_NOT_FOUND = "I'm sorry, but I don't have enough information to answer that question."
+
+
+def build_query_planner(cfg: Any):
+    planner_mode = getattr(cfg, "planner_mode", "none")
+    if not isinstance(planner_mode, str):
+        planner_mode = "none"
+    if planner_mode.lower() == "heuristic":
+        return HeuristicQueryPlanner(cfg)
+    return None
+
+
+def resolve_query_config(question: str, cfg: Any, planner: Any = None) -> Tuple[Any, Dict[str, Any]]:
+    planner_mode = getattr(cfg, "planner_mode", "none")
+    if not isinstance(planner_mode, str):
+        planner_mode = "none"
+    if planner_mode.lower() == "none":
+        return cfg, {}
+
+    planner = planner or build_query_planner(cfg)
+    if planner is None:
+        return cfg, {}
+
+    effective_cfg = planner.plan(question)
+    decision = planner.last_decision
+    planner_info = {
+        "planner_enabled": True,
+        "planner_name": planner.name,
+        "query_category": decision.category if decision else None,
+        "planner_features": decision.features if decision else {},
+        "planner_rationale": decision.rationale if decision else [],
+        "planner_config_diff": decision.config_diff if decision else {},
+    }
+    return effective_cfg, planner_info
+
+
+def build_query_runtime(cfg: Any, artifacts: Dict[str, Any]) -> Tuple[List[Any], EnsembleRanker]:
+    if (
+        artifacts.get("retrievers") is not None
+        and artifacts.get("ranker") is not None
+        and artifacts.get("faiss_index") is None
+        and artifacts.get("bm25_index") is None
+    ):
+        return artifacts["retrievers"], artifacts["ranker"]
+
+    retrievers = [
+        FAISSRetriever(artifacts["faiss_index"], cfg.embed_model),
+        BM25Retriever(artifacts["bm25_index"]),
+    ]
+
+    if cfg.ranker_weights.get("index_keywords", 0) > 0:
+        cache_key = (str(cfg.extracted_index_path), str(cfg.page_to_chunk_map_path))
+        index_retriever_cache = artifacts.setdefault("_index_keyword_retriever_cache", {})
+        if cache_key not in index_retriever_cache:
+            index_retriever_cache[cache_key] = IndexKeywordRetriever(
+                cfg.extracted_index_path,
+                cfg.page_to_chunk_map_path,
+            )
+        retrievers.append(index_retriever_cache[cache_key])
+
+    ranker = EnsembleRanker(
+        ensemble_method=cfg.ensemble_method,
+        weights=cfg.ranker_weights,
+        rrf_k=int(cfg.rrf_k),
+    )
+    return retrievers, ranker
+
+
+def retrieve_and_rank_chunks(
+    question: str,
+    cfg: Any,
+    artifacts: Dict[str, Any],
+    is_test_mode: bool = False,
+) -> Tuple[List[str], List[int], List[float], Optional[List[Dict[str, Any]]], Optional[str]]:
+    chunks = artifacts["chunks"]
+    retrievers, ranker = build_query_runtime(cfg, artifacts)
+    retrieval_query = question
+    hyde_query = None
+
+    if cfg.use_hyde:
+        hyde_query = generate_hypothetical_document(
+            question,
+            cfg.gen_model,
+            max_tokens=cfg.hyde_max_tokens,
+        )
+        retrieval_query = hyde_query
+
+    pool_n = max(cfg.num_candidates, cfg.top_k + 10)
+    raw_scores: Dict[str, Dict[int, float]] = {}
+    for retriever in retrievers:
+        raw_scores[retriever.name] = retriever.get_scores(retrieval_query, pool_n, chunks)
+
+    ordered, scores = ranker.rank(raw_scores=raw_scores)
+    topk_idxs = filter_retrieved_chunks(cfg, chunks, ordered)
+    ranked_chunks = [chunks[i] for i in topk_idxs]
+
+    chunks_info = None
+    if is_test_mode:
+        faiss_scores = raw_scores.get("faiss", {})
+        bm25_scores = raw_scores.get("bm25", {})
+        index_scores = raw_scores.get("index_keywords", {})
+
+        faiss_ranked = sorted(faiss_scores.keys(), key=lambda i: faiss_scores[i], reverse=True)
+        bm25_ranked = sorted(bm25_scores.keys(), key=lambda i: bm25_scores[i], reverse=True)
+        index_ranked = sorted(index_scores.keys(), key=lambda i: index_scores[i], reverse=True)
+
+        faiss_ranks = {idx: rank + 1 for rank, idx in enumerate(faiss_ranked)}
+        bm25_ranks = {idx: rank + 1 for rank, idx in enumerate(bm25_ranked)}
+        index_ranks = {idx: rank + 1 for rank, idx in enumerate(index_ranked)}
+
+        chunks_info = []
+        for rank, idx in enumerate(topk_idxs, 1):
+            chunks_info.append({
+                "rank": rank,
+                "chunk_id": idx,
+                "content": chunks[idx],
+                "faiss_score": faiss_scores.get(idx, 0),
+                "faiss_rank": faiss_ranks.get(idx, 0),
+                "bm25_score": bm25_scores.get(idx, 0),
+                "bm25_rank": bm25_ranks.get(idx, 0),
+                "index_score": index_scores.get(idx, 0),
+                "index_rank": index_ranks.get(idx, 0),
+            })
+
+    ranked_chunks = rerank(question, ranked_chunks, mode=cfg.rerank_mode, top_n=cfg.rerank_top_k)
+    return ranked_chunks, topk_idxs, scores, chunks_info, hyde_query
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Welcome to TokenSmith!")
@@ -109,11 +235,13 @@ def get_answer(
 ) -> Union[str, Tuple[str, List[Dict[str, Any]], Optional[str]]]:
     """
     Run a single query through the pipeline.
-    """    
+    """
+    effective_cfg, planner_info = resolve_query_config(question, cfg, artifacts.get("planner") if artifacts else None)
+    effective_log_info = dict(additional_log_info or {})
+    effective_log_info.update(planner_info)
+
     chunks = artifacts["chunks"]
     sources = artifacts["sources"]
-    retrievers = artifacts["retrievers"]
-    ranker = artifacts["ranker"]
     # Ensure these locals exist for all control flows to avoid UnboundLocalError
     ranked_chunks: List[str] = []
     topk_idxs: List[int] = []
@@ -122,92 +250,39 @@ def get_answer(
     # Step 1: Get chunks (golden, retrieved, or none)
     chunks_info = None
     hyde_query = None
-    if golden_chunks and cfg.use_golden_chunks:
+    if golden_chunks and effective_cfg.use_golden_chunks:
         # Use provided golden chunks
         ranked_chunks = golden_chunks
-    elif cfg.disable_chunks:
+    elif effective_cfg.disable_chunks:
         # No chunks - baseline mode
         ranked_chunks = []
-    elif cfg.use_indexed_chunks:
+    elif effective_cfg.use_indexed_chunks:
         ranked_chunks, topk_idxs = use_indexed_chunks(question, chunks)
     else:
-        retrieval_query = question
-        # print(f"Retrieval query: {retrieval_query}")
-        if cfg.use_hyde:
-            retrieval_query = generate_hypothetical_document(question, cfg.gen_model, max_tokens=cfg.hyde_max_tokens)
-        
-        pool_n = max(cfg.num_candidates, cfg.top_k + 10)
-        raw_scores: Dict[str, Dict[int, float]] = {}
-        for retriever in retrievers:
-            # print(f"Getting scores from retriever: {retriever.name}...")
-            raw_scores[retriever.name] = retriever.get_scores(retrieval_query, pool_n, chunks)
-        # TODO: Fix retrieval logging.
+        ranked_chunks, topk_idxs, scores, chunks_info, hyde_query = retrieve_and_rank_chunks(
+            question=question,
+            cfg=effective_cfg,
+            artifacts=artifacts,
+            is_test_mode=is_test_mode,
+        )
 
-        # print("Raw scores from retrievers:")
-        # for retriever_name, score_dict in raw_scores.items():
-        #     print(f"  {retriever_name}: {list(score_dict.values())}")
-        # Step 2: Ranking
-        ordered, scores = ranker.rank(raw_scores=raw_scores)
-        # print(f"Ordered candidate indices after ranking: {ordered[:cfg.top_k]}")
-        # print(f"Corresponding scores: {scores[:cfg.top_k]}")
-        topk_idxs = filter_retrieved_chunks(cfg, chunks, ordered)
-        ranked_chunks = [chunks[i] for i in topk_idxs]
-        # print(f"Top-{cfg.top_k} chunk indices after filtering: {topk_idxs}")
-        # print("Len Ranked chunks:", len(ranked_chunks))
-        # print("Example ranked chunk content:", ranked_chunks[0] if ranked_chunks else "No chunks retrieved")
-        
-        
-        # Capture chunk info if in test mode
-        if is_test_mode:
-            # Compute individual ranker ranks
-            faiss_scores = raw_scores.get("faiss", {})
-            bm25_scores = raw_scores.get("bm25", {})
-            index_scores = raw_scores.get("index_keywords", {})
-            
-            faiss_ranked = sorted(faiss_scores.keys(), key=lambda i: faiss_scores[i], reverse=True)
-            bm25_ranked = sorted(bm25_scores.keys(), key=lambda i: bm25_scores[i], reverse=True)
-            index_ranked = sorted(index_scores.keys(), key=lambda i: index_scores[i], reverse=True)
-            
-            faiss_ranks = {idx: rank + 1 for rank, idx in enumerate(faiss_ranked)}
-            bm25_ranks = {idx: rank + 1 for rank, idx in enumerate(bm25_ranked)}
-            index_ranks = {idx: rank + 1 for rank, idx in enumerate(index_ranked)}
-            
-            chunks_info = []
-            for rank, idx in enumerate(topk_idxs, 1):
-                chunks_info.append({
-                    "rank": rank,
-                    "chunk_id": idx,
-                    "content": chunks[idx],
-                    "faiss_score": faiss_scores.get(idx, 0),
-                    "faiss_rank": faiss_ranks.get(idx, 0),
-                    "bm25_score": bm25_scores.get(idx, 0),
-                    "bm25_rank": bm25_ranks.get(idx, 0),
-                    "index_score": index_scores.get(idx, 0),
-                    "index_rank": index_ranks.get(idx, 0),
-                })
-
-        # Step 3: Final re-ranking
-        ranked_chunks = rerank(question, ranked_chunks, mode=cfg.rerank_mode, top_n=cfg.rerank_top_k)
-        # print("Reranked Chunks", type(ranked_chunks), len(ranked_chunks), type(ranked_chunks[0]) if ranked_chunks else "No chunks")
-        # print("Example reranked chunk content:", ranked_chunks[0] if ranked_chunks else "No chunks after reranking")
-
-    if not ranked_chunks and not cfg.disable_chunks:
+    if not ranked_chunks and not effective_cfg.disable_chunks:
         if console:
             console.print(f"\n{ANSWER_NOT_FOUND}\n")
         return ANSWER_NOT_FOUND
 
     # Step 4: Generation
-    model_path = cfg.gen_model
-    system_prompt = args.system_prompt_mode or cfg.system_prompt_mode
+    model_path = effective_cfg.gen_model
+    system_prompt = args.system_prompt_mode or effective_cfg.system_prompt_mode
 
-    use_double = getattr(args, "double_prompt", False) or cfg.use_double_prompt
+    use_double = getattr(args, "double_prompt", False) or effective_cfg.use_double_prompt
 
     if use_double:
         stream_iter = double_answer(
             question,
             ranked_chunks,
             model_path,
-            max_tokens=cfg.max_gen_tokens,
+            max_tokens=effective_cfg.max_gen_tokens,
             system_prompt_mode=system_prompt,
         )
     else:
@@ -215,7 +290,7 @@ def get_answer(
             question,
             ranked_chunks,
             model_path,
-            max_tokens=cfg.max_gen_tokens,
+            max_tokens=effective_cfg.max_gen_tokens,
             system_prompt_mode=system_prompt,
         )
 
@@ -232,22 +307,30 @@ def get_answer(
 
         # Logging
         meta = artifacts.get("meta", [])
-        page_nums = get_page_numbers(topk_idxs, meta)
+        log_count = min(
+            len(topk_idxs),
+            len(ranked_chunks) if ranked_chunks else len(topk_idxs),
+            len(scores) if scores else len(topk_idxs),
+        )
+        log_top_idxs = topk_idxs[:log_count]
+        log_chunks = [chunks[i] for i in log_top_idxs]
+        log_sources = [sources[i] for i in log_top_idxs]
+        page_nums = get_page_numbers(log_top_idxs, meta)
         logger.save_chat_log(
             query=question,
-            config_state=cfg.get_config_state(),
-            ordered_scores=scores[:len(topk_idxs)] if 'scores' in locals() else [],
+            config_state=effective_cfg.get_config_state(),
+            ordered_scores=scores[:log_count] if scores else [],
             chat_request_params={
                 "system_prompt": system_prompt,
-                "max_tokens": cfg.max_gen_tokens
+                "max_tokens": effective_cfg.max_gen_tokens
             },
-            top_idxs=topk_idxs,
-            chunks=chunks,
-            sources=sources,
+            top_idxs=log_top_idxs,
+            chunks=log_chunks,
+            sources=log_sources,
             page_map=page_nums,
             full_response=ans,
-            top_k=len(topk_idxs),
-            additional_log_info=additional_log_info
+            top_k=len(log_top_idxs),
+            additional_log_info=effective_log_info
         )
         return ans
 
@@ -281,25 +364,27 @@ def get_keywords(question: str) -> list:
 def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
     logger = get_logger()
     console = Console()
+    planner = build_query_planner(cfg)
 
     print("Initializing TokenSmith Chat...")
     try:
         artifacts_dir = cfg.get_artifacts_directory()
         faiss_idx, bm25_idx, chunks, sources, meta = load_artifacts(artifacts_dir, args.index_prefix)
         print(f"Loaded {len(chunks)} chunks and {len(sources)} sources from artifacts.")
-        retrievers = [FAISSRetriever(faiss_idx, cfg.embed_model), BM25Retriever(bm25_idx)]
-        if cfg.ranker_weights.get("index_keywords", 0) > 0:
-            retrievers.append(IndexKeywordRetriever(cfg.extracted_index_path, cfg.page_to_chunk_map_path))
-        
-        ranker = EnsembleRanker(ensemble_method=cfg.ensemble_method, weights=cfg.ranker_weights, rrf_k=int(cfg.rrf_k))
-        print("Loaded retrievers and initialized ranker.")
-        artifacts = {"chunks": chunks, "sources": sources, "retrievers": retrievers, "ranker": ranker, "meta": meta}
+        print("Loaded indexes and source artifacts.")
+        artifacts = {
+            "chunks": chunks,
+            "sources": sources,
+            "faiss_index": faiss_idx,
+            "bm25_index": bm25_idx,
+            "meta": meta,
+            "planner": planner,
+        }
     except Exception as e:
         print(f"ERROR: {e}. Run 'index' mode first.")
         sys.exit(1)
 
     chat_history = []
-    additional_log_info = {}
     print("Initialization complete. You can start asking questions!")
     print("Type 'exit' or 'quit' to end the session.")
     while True:
@@ -313,6 +398,7 @@ def run_chat_session(args: argparse.Namespace, cfg: RAGConfig):
                 break
             
             effective_q = q
+            additional_log_info = {}
             if cfg.enable_history and chat_history:
                 try:
                     effective_q = contextualize_query(q, chat_history, cfg.gen_model)

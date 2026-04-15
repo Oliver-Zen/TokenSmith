@@ -1,4 +1,5 @@
 import json
+import time
 import pytest
 from pathlib import Path
 from datetime import datetime
@@ -58,6 +59,7 @@ def print_test_config(config, scorer):
     print(f"  Chunks Enabled:     {not config['disable_chunks']}")
     print(f"  Golden Chunks:      {config['use_golden_chunks']}")
     print(f"  HyDE Enabled:       {config.get('use_hyde', False)}")
+    print(f"  Planner Mode:       {config.get('planner_mode', 'none')}")
     print(f"  Output Mode:        {config['output_mode']}")
     print(f"  Metrics:            {', '.join(active_metrics)}")
     print(f"{'='*60}\n")
@@ -87,11 +89,13 @@ def run_benchmark(benchmark, config, results_dir, scorer):
     
     # Get answer from TokenSmith
     try:
-        retrieved_answer, chunks_info, hyde_query = get_tokensmith_answer(
+        start = time.perf_counter()
+        retrieved_answer, chunks_info, hyde_query, planner_info = get_tokensmith_answer(
             question=question,
             config=config,
             golden_chunks=golden_chunks if config["use_golden_chunks"] else None
         )
+        latency_ms = round((time.perf_counter() - start) * 1000, 2)
     except Exception as e:
         import logging, traceback
         error_msg = f"Error running TokenSmith: {e}"
@@ -139,6 +143,10 @@ def run_benchmark(benchmark, config, results_dir, scorer):
         "metric_weights": get_metric_weights(scorer, scores.get("active_metrics", [])),
         "chunks_info": chunks_info if chunks_info else [],
         "hyde_query": hyde_query if hyde_query else None,
+        "latency_ms": latency_ms,
+        "planner_mode": config.get("planner_mode", "none"),
+        "query_category": (planner_info or {}).get("query_category"),
+        "planner_info": planner_info or {},
         "timestamp": datetime.now().isoformat(),
         "config": {
             "model_path": config["model_path"],
@@ -174,10 +182,10 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
         tuple: (Generated answer, chunks_info list, hyde_query)
     """
     from src.main import get_answer
+    from src.main import build_query_planner, resolve_query_config
     from src.instrumentation.logging import get_logger
     from src.config import RAGConfig
-    from src.retriever import BM25Retriever, FAISSRetriever, IndexKeywordRetriever, load_artifacts
-    from src.ranking.ranker import EnsembleRanker
+    from src.retriever import load_artifacts
     import argparse
     
     # Create a mock args namespace with our config values
@@ -192,8 +200,8 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
         chunk_mode=config.get("chunk_mode", "recursive_sections"),
         top_k=config.get("top_k", 10),
         embed_model=config.get("embed_model"),
-        ensemble_method=config.get("retrieval_method", "rrf"),
-        rrf_k=60,
+        ensemble_method=config.get("ensemble_method", config.get("retrieval_method", "rrf")),
+        rrf_k=config.get("rrf_k", 60),
         ranker_weights=config.get("ranker_weights", {"faiss": 1, "bm25": 0}),
         rerank_mode=config.get("rerank_mode", "none"),
         rerank_top_k=config.get("rerank_top_k", 5),
@@ -205,6 +213,7 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
         metrics=config.get("metrics", ["all"]),
         use_hyde=config.get("use_hyde", False),
         hyde_max_tokens=config.get("hyde_max_tokens", 300),
+        planner_mode=config.get("planner_mode", "none"),
         use_indexed_chunks=config.get("use_indexed_chunks", False),
         extracted_index_path=config.get("extracted_index_path", "data/extracted_index.json"),
         page_to_chunk_map_path=config.get("page_to_chunk_map_path", "index/sections/textbook_index_page_to_chunk_map.json"),
@@ -221,6 +230,8 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
         print(f"  🔍 Retrieving chunks...")
     
     logger = get_logger()
+    planner = build_query_planner(cfg)
+    _, planner_info = resolve_query_config(question, cfg, planner)
 
     # Run the query through the main pipeline
     artifacts_dir = cfg.get_artifacts_directory()
@@ -228,31 +239,15 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
         artifacts_dir=artifacts_dir, 
         index_prefix=config["index_prefix"]
     )
-
-    retrievers = [
-        FAISSRetriever(faiss_index, cfg.embed_model),
-        BM25Retriever(bm25_index)
-    ]
-    
-    # Add index keyword retriever if weight > 0
-    if cfg.ranker_weights.get("index_keywords", 0) > 0:
-        retrievers.append(
-            IndexKeywordRetriever(cfg.extracted_index_path, cfg.page_to_chunk_map_path)
-        )
-    
-    ranker = EnsembleRanker(
-        ensemble_method=cfg.ensemble_method,
-        weights=cfg.ranker_weights,
-        rrf_k=int(cfg.rrf_k)
-    )
     
     # Package artifacts for reuse
     artifacts = {
+        "faiss_index": faiss_index,
+        "bm25_index": bm25_index,
         "chunks": chunks,
         "sources": sources,
-        "retrievers": retrievers,
-        "ranker": ranker,
-        "metadata": metadata,
+        "meta": metadata,
+        "planner": planner,
     }
 
     result = get_answer(
@@ -275,7 +270,7 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
     # Clean answer - extract up to end token if present
     generated = clean_answer(generated)
     
-    return generated, chunks_info, hyde_query
+    return generated, chunks_info, hyde_query, planner_info
 
 
 def clean_answer(text):

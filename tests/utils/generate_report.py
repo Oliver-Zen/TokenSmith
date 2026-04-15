@@ -148,6 +148,13 @@ def _generate_summary_stats(results: List[Dict[Any, Any]], active_metrics: set) 
     min_score = min(scores)
     max_score = max(scores)
     passed = sum(1 for r in results if r['passed'])
+    latencies = [r.get('latency_ms') for r in results if r.get('latency_ms') is not None]
+    avg_latency = np.mean(latencies) if latencies else None
+    categories = {}
+    for result in results:
+        category = result.get("query_category")
+        if category:
+            categories[category] = categories.get(category, 0) + 1
     
     # Calculate per-metric averages
     metric_averages = {}
@@ -164,7 +171,9 @@ def _generate_summary_stats(results: List[Dict[Any, Any]], active_metrics: set) 
         <p><strong>Failed:</strong> {len(results) - passed}</p>
         <p><strong>Average Score:</strong> {avg_score:.3f}</p>
         <p><strong>Score Range:</strong> {min_score:.3f} - {max_score:.3f}</p>
+        <p><strong>Average Latency:</strong> {f"{avg_latency:.2f} ms" if avg_latency is not None else 'n/a'}</p>
         <p><strong>Active Metrics:</strong> {', '.join(sorted(active_metrics))}</p>
+        <p><strong>Query Categories:</strong> {', '.join(f"{k} ({v})" for k, v in sorted(categories.items())) or 'n/a'}</p>
         
         <h3>Per-Metric Averages</h3>
         <div class="metric-grid">
@@ -221,6 +230,8 @@ def _generate_detailed_results(results: List[Dict[Any, Any]], active_metrics: se
         <p><strong>Final Score:</strong> <span class="score">{scores['final_score']:.3f}</span></p>
         <p><strong>Threshold:</strong> {result['threshold']:.3f}</p>
         <p><strong>Active Metrics:</strong> {', '.join(result.get('active_metrics', []))}</p>
+        <p><strong>Latency:</strong> {result.get('latency_ms', 'n/a')} ms</p>
+        <p><strong>Query Category:</strong> {result.get('query_category', 'n/a')}</p>
         
         <div class="metric-grid">
         """
