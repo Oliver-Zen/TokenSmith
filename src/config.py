@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict
 
 import yaml
@@ -45,6 +45,9 @@ class RAGConfig:
     hyde_max_tokens: int = 300
     use_double_prompt: bool = False
 
+    # planning
+    planner_mode: str = "none"
+
     # conversational memory
     enable_history: bool = True
     max_history_turns: int = 3
@@ -58,7 +61,7 @@ class RAGConfig:
     @classmethod
     def from_yaml(cls, path: os.PathLike) -> RAGConfig:
         with open(path, 'r') as f:
-            data = yaml.safe_load(open(path))
+            data = yaml.safe_load(f) or {}
         return cls(**data)
     
     def __post_init__(self):
@@ -66,6 +69,7 @@ class RAGConfig:
         assert self.top_k > 0, "top_k must be > 0"
         assert self.num_candidates >= self.top_k, "num_candidates must be >= top_k"
         assert self.ensemble_method.lower() in {"linear","weighted","rrf"}
+        assert self.planner_mode.lower() in {"none", "heuristic"}, "planner_mode must be 'none' or 'heuristic'"
         if self.ensemble_method.lower() in {"linear","weighted"}:
             s = sum(self.ranker_weights.values()) or 1.0
             self.ranker_weights = {k: v/s for k, v in self.ranker_weights.items()}
@@ -96,7 +100,7 @@ class RAGConfig:
         strategy_dir.mkdir(parents=True, exist_ok=True)
         return strategy_dir
     
-    def get_config_state(self) -> None:
+    def get_config_state(self) -> Dict[str, object]:
         """Returns dict of all config parameters except chunk_config """
         state = self.__dict__.copy()
         state.pop("chunk_config", None) # remove chunk_config to avoid serialization issues
@@ -105,4 +109,10 @@ class RAGConfig:
             if not isinstance(state[key], (int, float, str, bool, list, dict, type(None))):
                 state.pop(key)
         return state
+
+    def to_dict(self) -> Dict[str, object]:
+        return self.get_config_state()
+
+    def with_updates(self, **kwargs) -> "RAGConfig":
+        return replace(self, **kwargs)
         
