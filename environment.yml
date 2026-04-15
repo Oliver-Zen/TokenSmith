@@ -22,9 +22,13 @@ dependencies:
     - transformers
     - sentence-transformers
     - rank_bm25
+<<<<<<< Updated upstream
     - langchain
     - langchain_text_splitters
     - google-genai
+=======
+    - langchain<0.2
+>>>>>>> Stashed changes
     - pytest
     - rich
     - langchain-text-splitters
