@@ -15,6 +15,7 @@ class PlanDecision:
     features: Dict[str, Any] = field(default_factory=dict)
     rationale: List[str] = field(default_factory=list)
     config_diff: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 class QueryPlanner(ABC):
@@ -37,6 +38,16 @@ class QueryPlanner(ABC):
         Subclasses must override this to return an updated RAGConfig.
         """
 
+    def record_feedback(
+        self,
+        *,
+        query: str,
+        latency_ms: Optional[float] = None,
+        quality_signal: Optional[float] = None,
+    ) -> None:
+        """Optional online update hook for adaptive planners."""
+        return None
+
     # ---- helper for subclasses ----
     def _config_diff(self, new_cfg: RAGConfig) -> Dict[str, Dict[str, Any]]:
         base_dict = self.base_cfg.to_dict()
@@ -55,6 +66,7 @@ class QueryPlanner(ABC):
         features: Optional[Dict[str, Any]],
         rationale: Optional[List[str]],
         new_cfg: RAGConfig,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         self.last_decision = PlanDecision(
             planner_name=self.name,
@@ -63,6 +75,7 @@ class QueryPlanner(ABC):
             features=features or {},
             rationale=rationale or [],
             config_diff=self._config_diff(new_cfg),
+            metadata=metadata or {},
         )
         self._log_decision(new_cfg)
 
