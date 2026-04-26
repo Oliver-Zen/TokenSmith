@@ -5,6 +5,7 @@ import argparse
 import json
 import pathlib
 import sys
+import time
 from typing import Dict, Optional, List, Tuple, Union, Any
 
 from rich.live import Live
@@ -15,6 +16,7 @@ from src.config import RAGConfig
 from src.generator import answer, double_answer, dedupe_generated_text
 from src.index_builder import build_index
 from src.instrumentation.logging import get_logger
+from src.planning.cost_based import AdaptiveQueryPlanner, CostBasedQueryPlanner
 from src.planning.heuristics import HeuristicQueryPlanner
 from src.ranking.ranker import EnsembleRanker
 from src.preprocessing.chunking import DocumentChunker
@@ -36,8 +38,13 @@ def build_query_planner(cfg: Any):
     planner_mode = getattr(cfg, "planner_mode", "none")
     if not isinstance(planner_mode, str):
         planner_mode = "none"
-    if planner_mode.lower() == "heuristic":
+    planner_mode = planner_mode.lower()
+    if planner_mode == "heuristic":
         return HeuristicQueryPlanner(cfg)
+    if planner_mode == "cost_based":
+        return CostBasedQueryPlanner(cfg)
+    if planner_mode == "adaptive":
+        return AdaptiveQueryPlanner(cfg)
     return None
 
 
@@ -61,6 +68,13 @@ def resolve_query_config(question: str, cfg: Any, planner: Any = None) -> Tuple[
         "planner_features": decision.features if decision else {},
         "planner_rationale": decision.rationale if decision else [],
         "planner_config_diff": decision.config_diff if decision else {},
+        "planner_metadata": decision.metadata if decision else {},
+        "selected_plan_id": decision.metadata.get("selected_plan_id") if decision else None,
+        "planner_used_cache": bool(decision.metadata.get("used_cache")) if decision else False,
+        "estimated_latency_ms": decision.metadata.get("estimated_latency_ms") if decision else None,
+        "estimated_quality": decision.metadata.get("estimated_quality") if decision else None,
+        "latency_budget_ms": decision.metadata.get("latency_budget_ms") if decision else None,
+        "pareto_frontier": decision.metadata.get("pareto_frontier", []) if decision else [],
     }
     return effective_cfg, planner_info
 
@@ -236,7 +250,9 @@ def get_answer(
     """
     Run a single query through the pipeline.
     """
-    effective_cfg, planner_info = resolve_query_config(question, cfg, artifacts.get("planner") if artifacts else None)
+    start_time = time.perf_counter()
+    planner = artifacts.get("planner") if artifacts else None
+    effective_cfg, planner_info = resolve_query_config(question, cfg, planner)
     effective_log_info = dict(additional_log_info or {})
     effective_log_info.update(planner_info)
 
@@ -269,6 +285,8 @@ def get_answer(
     if not ranked_chunks and not effective_cfg.disable_chunks:
         if console:
             console.print(f"\n{ANSWER_NOT_FOUND}\n")
+        if planner is not None:
+            planner.record_feedback(query=question, latency_ms=round((time.perf_counter() - start_time) * 1000, 2), quality_signal=0.0)
         return ANSWER_NOT_FOUND
 
     # Step 4: Generation
@@ -300,6 +318,13 @@ def get_answer(
         for delta in stream_iter:
             ans += delta
         ans = dedupe_generated_text(ans)
+        if planner is not None:
+            quality_proxy = 0.0 if ans == ANSWER_NOT_FOUND else min(0.85, 0.35 + 0.08 * len(ranked_chunks) + 0.02 * bool(hyde_query))
+            planner.record_feedback(
+                query=question,
+                latency_ms=round((time.perf_counter() - start_time) * 1000, 2),
+                quality_signal=quality_proxy,
+            )
         return ans, chunks_info, hyde_query
     else:
         # Accumulate the full text while rendering incremental Markdown chunks
@@ -332,6 +357,13 @@ def get_answer(
             top_k=len(log_top_idxs),
             additional_log_info=effective_log_info
         )
+        if planner is not None:
+            quality_proxy = 0.0 if ans == ANSWER_NOT_FOUND else min(0.85, 0.35 + 0.08 * len(ranked_chunks) + 0.02 * bool(hyde_query))
+            planner.record_feedback(
+                query=question,
+                latency_ms=round((time.perf_counter() - start_time) * 1000, 2),
+                quality_signal=quality_proxy,
+            )
         return ans
 
 def render_streaming_ans(console, stream_iter):

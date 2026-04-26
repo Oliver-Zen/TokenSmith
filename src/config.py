@@ -47,6 +47,10 @@ class RAGConfig:
 
     # planning
     planner_mode: str = "none"
+    latency_budget_ms: int = 900
+    planner_feedback_alpha: float = 0.35
+    planner_cache_max_entries: int = 64
+    planner_cache_quality_threshold: float = 0.7
 
     # conversational memory
     enable_history: bool = True
@@ -69,7 +73,15 @@ class RAGConfig:
         assert self.top_k > 0, "top_k must be > 0"
         assert self.num_candidates >= self.top_k, "num_candidates must be >= top_k"
         assert self.ensemble_method.lower() in {"linear","weighted","rrf"}
-        assert self.planner_mode.lower() in {"none", "heuristic"}, "planner_mode must be 'none' or 'heuristic'"
+        assert self.planner_mode.lower() in {"none", "heuristic", "cost_based", "adaptive"}, (
+            "planner_mode must be 'none', 'heuristic', 'cost_based', or 'adaptive'"
+        )
+        assert self.latency_budget_ms > 0, "latency_budget_ms must be > 0"
+        assert 0 < self.planner_feedback_alpha <= 1.0, "planner_feedback_alpha must be in (0, 1]"
+        assert self.planner_cache_max_entries > 0, "planner_cache_max_entries must be > 0"
+        assert 0 <= self.planner_cache_quality_threshold <= 1.0, (
+            "planner_cache_quality_threshold must be in [0, 1]"
+        )
         if self.ensemble_method.lower() in {"linear","weighted"}:
             s = sum(self.ranker_weights.values()) or 1.0
             self.ranker_weights = {k: v/s for k, v in self.ranker_weights.items()}
