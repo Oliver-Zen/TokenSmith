@@ -14,6 +14,7 @@
 * Configurable chunking (tokens or characters)
 * Optional indexing progress visualization
 * Table preservation during indexing (flag-based)
+* Query planning modes: static, heuristic, cost-based, and adaptive
 
 ## Requirements
 
@@ -178,6 +179,15 @@ make run-index ARGS="--pdf_dir <path_to_pdf> --index_prefix book_index --config 
 python -m src.main chat --config <path_to_yaml> --model_path <path_to_gguf>
 ```
 
+Planner-related config options:
+
+```yaml
+planner_mode: "adaptive"   # one of: none, heuristic, cost_based, adaptive
+latency_budget_ms: 900
+planner_feedback_alpha: 0.35
+planner_cache_quality_threshold: 0.7
+```
+
 ### Use an existing llama.cpp build
 
 ```shell
@@ -237,7 +247,7 @@ pytest tests/ --benchmark-ids="test" -s
 
 * Tests call the same `get_answer()` pipeline used by chat
 * Metrics: semantic similarity, BLEU, keyword matching, text similarity
-* Outputs: terminal logs and HTML report
+* Outputs: terminal logs and HTML report, including selected plans and Pareto quality/latency views
 * System prompts: baseline, tutor, concise, detailed
 * Component isolation: run with/without chunks or with golden chunks
 

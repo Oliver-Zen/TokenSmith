@@ -15,7 +15,7 @@ TokenSmith is a Retrieval-Augmented Generation (RAG) application that lets you i
   - `load_artifacts()` loads indexes/chunks/sources.
   - `apply_seg_filter()` optional segment filtering before top-k.
 - **Ranking (`src/ranking/ranker.py`)**: `EnsembleRanker` fuses retriever signals using weighted Linear or RRF. Re-ranking via cross-encoder exists in `src/ranking/reranker.py` (currently disabled in main flow).
-- **Planning (`src/planning/*.py`)**: `HeuristicQueryPlanner` classifies each query as definitional, explanatory, analytical, or procedural using query length, question type, comparison terms, and entity density, then emits a per-query `RAGConfig`.
+- **Planning (`src/planning/*.py`)**: TokenSmith supports heuristic, cost-based, and adaptive planners. The heuristic planner classifies each query as definitional, explanatory, analytical, or procedural using query length, question type, comparison terms, and entity density. The cost-based planner enumerates candidate plans, estimates quality and latency, and selects from the Pareto frontier under a latency budget. The adaptive planner adds online feedback updates and cache reuse for successful query-class/plan mappings.
 - **Generation (`src/generator.py`)**: Builds a prompt (modes: baseline, tutor, concise, detailed), shells out to `llama-cli`, and extracts the answer between markers.
 - **Entrypoint (`src/main.py`)**:
   - `index` mode builds artifacts.
@@ -37,7 +37,7 @@ TokenSmith is a Retrieval-Augmented Generation (RAG) application that lets you i
 ### Configuration Highlights (`config/config.yaml`)
 - `chunk_mode`: currently supports section-based recursive strategy via `SectionRecursiveConfig`.
 - Retrieval: `top_k`, `pool_size`, `ensemble_method` (rrf/linear), `ranker_weights`, `rrf_k`.
-- Planning: `planner_mode` (`none` or `heuristic`) controls whether TokenSmith uses static retrieval settings or chooses a per-query execution plan.
+- Planning: `planner_mode` (`none`, `heuristic`, `cost_based`, or `adaptive`) controls whether TokenSmith uses static retrieval settings, rule-based query classes, budget-aware plan enumeration, or feedback-driven plan reuse.
 - Generation: `model_path`, `max_gen_tokens`, `system_prompt_mode` (baseline/tutor/concise/detailed).
 - Testing toggles: `disable_chunks`, `use_golden_chunks`, `output_mode`, `metrics`.
 
@@ -52,7 +52,7 @@ TokenSmith is a Retrieval-Augmented Generation (RAG) application that lets you i
 
 ### Testing (`tests/`)
 - `tests/test_benchmarks.py` runs benchmark questions through the same pipeline.
-- Benchmark results now record latency and planner-selected query category for quality/latency comparisons.
+- Benchmark results now record latency, selected plan IDs, planner-selected query category, cache hits, and Pareto frontier metadata for quality/latency comparisons.
 - Pluggable metrics in `tests/metrics/*` (semantic similarity, keyword match, NLI). Outputs terminal or HTML reports and JSON logs.
 
 ### Notes
