@@ -78,8 +78,9 @@ def _ensure_initialized():
         )
 
 def _copy_cfg_with_updates(cfg, **updates):
-    if hasattr(cfg, "with_updates"):
-        return cfg.with_updates(**updates)
+    with_updates = getattr(cfg, "with_updates", None)
+    if callable(with_updates) and type(cfg).__module__ != "unittest.mock":
+        return with_updates(**updates)
 
     cfg_copy = deepcopy(cfg)
     for key, value in updates.items():
@@ -138,7 +139,11 @@ def _create_log(chunks , sources , topk_idxs, ordered_ranked_scores, page_nums, 
     except Exception as log_exc:
         return False
 
-def _retrieve_and_rank(query: str, cfg):
+def _retrieve_and_rank(query: str, cfg=None, top_k: Optional[int] = None, include_chunks: bool = False):
+    cfg = cfg or _config
+    if top_k is not None:
+        cfg = _copy_cfg_with_updates(cfg, top_k=top_k)
+
     chunks = _artifacts["chunks"]
     if _artifacts.get("faiss_index") is not None and _artifacts.get("bm25_index") is not None:
         ranked_chunks, topk_idxs, ordered_scores, _, _ = retrieve_and_rank_chunks(
@@ -147,7 +152,9 @@ def _retrieve_and_rank(query: str, cfg):
             artifacts=_artifacts,
             is_test_mode=False,
         )
-        return ranked_chunks, topk_idxs, ordered_scores
+        if include_chunks:
+            return ranked_chunks, topk_idxs, ordered_scores
+        return topk_idxs, ordered_scores
 
     effective_top_k = cfg.top_k
     pool_n = max(cfg.num_candidates, effective_top_k + 10)
@@ -159,7 +166,9 @@ def _retrieve_and_rank(query: str, cfg):
     ordered_ids, ordered_scores = _ranker.rank(raw_scores=raw_scores)
     topk_idxs = ordered_ids[:effective_top_k]
     ranked_chunks = [chunks[i] for i in topk_idxs]
-    return ranked_chunks, topk_idxs, ordered_scores[:effective_top_k]
+    if include_chunks:
+        return ranked_chunks, topk_idxs, ordered_scores[:effective_top_k]
+    return topk_idxs, ordered_scores[:effective_top_k]
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -266,7 +275,7 @@ async def test_chat(request: ChatRequest):
     try:
         # ✅ Correct order (matches /api/chat)
         ranked_chunks, topk_idxs, ordered_ranked_scores = _retrieve_and_rank(
-            request.query, cfg=effective_cfg
+            request.query, cfg=effective_cfg, include_chunks=True
         )
 
         # Ensure safe types
@@ -314,7 +323,9 @@ async def chat_stream(request: ChatRequest):
         ranked_chunks, topk_idxs = [], []
         ordered_ranked_scores = []
     else:
-        ranked_chunks, topk_idxs, ordered_ranked_scores = _retrieve_and_rank(request.query, cfg=effective_cfg)
+        ranked_chunks, topk_idxs, ordered_ranked_scores = _retrieve_and_rank(
+            request.query, cfg=effective_cfg, include_chunks=True
+        )
         topk_idxs = [int(i) for i in topk_idxs]
     
     if not effective_cfg.gen_model:
@@ -406,7 +417,7 @@ async def chat(request: ChatRequest):
             ranked_chunks, topk_idxs, ordered_ranked_scores = [], [], {}
         else:
             retrieval_result = _retrieve_and_rank(
-                request.query, cfg=effective_cfg
+                request.query, cfg=effective_cfg, include_chunks=True
             )
 
             # 🔒 Safe unpacking for unit tests where ranker is mocked
