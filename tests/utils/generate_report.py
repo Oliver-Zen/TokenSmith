@@ -1,4 +1,5 @@
 import json
+import html
 import numpy as np
 from pathlib import Path
 from typing import List, Dict, Any
@@ -30,6 +31,7 @@ def generate_summary_report(results_dir: Path):
     # Generate adaptive HTML content
     html_content = _generate_html_template()
     html_content += _generate_summary_stats(results, all_metrics)
+    html_content += _generate_plan_analysis(results)
     html_content += _generate_detailed_results(results, all_metrics)
     
     # Add separate async LLM judge section if available
@@ -151,10 +153,17 @@ def _generate_summary_stats(results: List[Dict[Any, Any]], active_metrics: set) 
     latencies = [r.get('latency_ms') for r in results if r.get('latency_ms') is not None]
     avg_latency = np.mean(latencies) if latencies else None
     categories = {}
+    plan_counts = {}
+    cache_hits = 0
     for result in results:
         category = result.get("query_category")
         if category:
             categories[category] = categories.get(category, 0) + 1
+        selected_plan_id = result.get("selected_plan_id")
+        if selected_plan_id:
+            plan_counts[selected_plan_id] = plan_counts.get(selected_plan_id, 0) + 1
+        if result.get("planner_used_cache"):
+            cache_hits += 1
     
     # Calculate per-metric averages
     metric_averages = {}
@@ -174,6 +183,8 @@ def _generate_summary_stats(results: List[Dict[Any, Any]], active_metrics: set) 
         <p><strong>Average Latency:</strong> {f"{avg_latency:.2f} ms" if avg_latency is not None else 'n/a'}</p>
         <p><strong>Active Metrics:</strong> {', '.join(sorted(active_metrics))}</p>
         <p><strong>Query Categories:</strong> {', '.join(f"{k} ({v})" for k, v in sorted(categories.items())) or 'n/a'}</p>
+        <p><strong>Selected Plans:</strong> {', '.join(f"{k} ({v})" for k, v in sorted(plan_counts.items())) or 'n/a'}</p>
+        <p><strong>Cache Hits:</strong> {cache_hits}</p>
         
         <h3>Per-Metric Averages</h3>
         <div class="metric-grid">
@@ -184,6 +195,147 @@ def _generate_summary_stats(results: List[Dict[Any, Any]], active_metrics: set) 
     
     html += "</div></div>"
     return html
+
+
+def _pareto_points(results: List[Dict[Any, Any]]) -> List[Dict[str, Any]]:
+    points = []
+    for result in results:
+        latency = result.get("latency_ms")
+        quality = result.get("scores", {}).get("final_score")
+        if latency is None or quality is None:
+            continue
+        points.append(
+            {
+                "latency_ms": float(latency),
+                "quality": float(quality),
+                "label": result.get("selected_plan_id") or result.get("test_id") or "query",
+            }
+        )
+    return points
+
+
+def _pareto_frontier(points: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    frontier = []
+    for point in sorted(points, key=lambda item: (item["latency_ms"], -item["quality"])):
+        dominated = False
+        for other in points:
+            if other is point:
+                continue
+            if (
+                other["latency_ms"] <= point["latency_ms"]
+                and other["quality"] >= point["quality"]
+                and (
+                    other["latency_ms"] < point["latency_ms"]
+                    or other["quality"] > point["quality"]
+                )
+            ):
+                dominated = True
+                break
+        if not dominated:
+            frontier.append(point)
+    return frontier
+
+
+def _render_pareto_svg(points: List[Dict[str, Any]], title: str) -> str:
+    if not points:
+        return "<p>No latency/quality data available.</p>"
+
+    width = 720
+    height = 280
+    margin = 36
+    min_latency = min(point["latency_ms"] for point in points)
+    max_latency = max(point["latency_ms"] for point in points)
+    min_quality = min(point["quality"] for point in points)
+    max_quality = max(point["quality"] for point in points)
+    latency_span = max(max_latency - min_latency, 1.0)
+    quality_span = max(max_quality - min_quality, 0.01)
+
+    def x_pos(latency: float) -> float:
+        return margin + ((latency - min_latency) / latency_span) * (width - margin * 2)
+
+    def y_pos(quality: float) -> float:
+        return height - margin - ((quality - min_quality) / quality_span) * (height - margin * 2)
+
+    frontier = _pareto_frontier(points)
+    frontier_path = " ".join(
+        f"{'M' if idx == 0 else 'L'} {x_pos(point['latency_ms']):.1f} {y_pos(point['quality']):.1f}"
+        for idx, point in enumerate(frontier)
+    )
+
+    svg = [
+        f"<h3>{html.escape(title)}</h3>",
+        f'<svg viewBox="0 0 {width} {height}" style="width: 100%; height: auto; background: #fff; border: 1px solid #ddd; border-radius: 6px;">',
+        f'<line x1="{margin}" y1="{height - margin}" x2="{width - margin}" y2="{height - margin}" stroke="#999" />',
+        f'<line x1="{margin}" y1="{margin}" x2="{margin}" y2="{height - margin}" stroke="#999" />',
+        f'<text x="{width / 2:.1f}" y="{height - 8}" text-anchor="middle" font-size="12">Latency (ms)</text>',
+        f'<text x="18" y="{height / 2:.1f}" text-anchor="middle" font-size="12" transform="rotate(-90 18 {height / 2:.1f})">Quality</text>',
+    ]
+    if frontier_path:
+        svg.append(f'<path d="{frontier_path}" fill="none" stroke="#f97316" stroke-width="2" />')
+    for point in points:
+        cx = x_pos(point["latency_ms"])
+        cy = y_pos(point["quality"])
+        label = html.escape(f"{point['label']} ({point['latency_ms']:.0f} ms, {point['quality']:.2f})")
+        svg.append(f'<circle cx="{cx:.1f}" cy="{cy:.1f}" r="4" fill="#2563eb"><title>{label}</title></circle>')
+    svg.append("</svg>")
+    return "\n".join(svg)
+
+
+def _generate_plan_analysis(results: List[Dict[Any, Any]]) -> str:
+    categories: Dict[str, List[Dict[Any, Any]]] = {}
+    for result in results:
+        category = result.get("query_category") or "uncategorized"
+        categories.setdefault(category, []).append(result)
+
+    html_parts = ["<h2>Plan Analysis</h2>"]
+    html_parts.append("<div class=\"summary\">")
+    html_parts.append("<p><strong>Pareto frontier visualizations</strong> use actual benchmark latency and final score for each selected plan.</p>")
+    html_parts.append("</div>")
+
+    overall_points = _pareto_points(results)
+    html_parts.append(_render_pareto_svg(overall_points, "Overall Quality vs. Latency"))
+
+    for category, category_results in sorted(categories.items()):
+        points = _pareto_points(category_results)
+        html_parts.append(_render_pareto_svg(points, f"{category.title()} Queries"))
+
+        rows = []
+        for result in category_results:
+            rows.append(
+                "<tr>"
+                f"<td>{html.escape(str(result.get('test_id') or 'n/a'))}</td>"
+                f"<td>{html.escape(str(result.get('selected_plan_id') or 'n/a'))}</td>"
+                f"<td>{result.get('latency_ms', 'n/a')}</td>"
+                f"<td>{result.get('scores', {}).get('final_score', 'n/a')}</td>"
+                f"<td>{result.get('estimated_latency_ms', 'n/a')}</td>"
+                f"<td>{result.get('estimated_quality', 'n/a')}</td>"
+                f"<td>{'yes' if result.get('planner_used_cache') else 'no'}</td>"
+                "</tr>"
+            )
+        html_parts.append(
+            """
+            <table style="width: 100%; border-collapse: collapse; margin: 12px 0 24px 0;">
+                <thead>
+                    <tr>
+                        <th style="text-align: left; border-bottom: 1px solid #ddd; padding: 6px;">Benchmark</th>
+                        <th style="text-align: left; border-bottom: 1px solid #ddd; padding: 6px;">Plan</th>
+                        <th style="text-align: left; border-bottom: 1px solid #ddd; padding: 6px;">Actual Latency</th>
+                        <th style="text-align: left; border-bottom: 1px solid #ddd; padding: 6px;">Actual Score</th>
+                        <th style="text-align: left; border-bottom: 1px solid #ddd; padding: 6px;">Pred. Latency</th>
+                        <th style="text-align: left; border-bottom: 1px solid #ddd; padding: 6px;">Pred. Quality</th>
+                        <th style="text-align: left; border-bottom: 1px solid #ddd; padding: 6px;">Cache Hit</th>
+                    </tr>
+                </thead>
+                <tbody>
+            """
+            + "".join(rows)
+            + """
+                </tbody>
+            </table>
+            """
+        )
+
+    return "\n".join(html_parts)
 
 def _convert_markdown_to_html(text: str) -> str:
     """Convert markdown to HTML with LaTeX math support."""
@@ -232,6 +384,9 @@ def _generate_detailed_results(results: List[Dict[Any, Any]], active_metrics: se
         <p><strong>Active Metrics:</strong> {', '.join(result.get('active_metrics', []))}</p>
         <p><strong>Latency:</strong> {result.get('latency_ms', 'n/a')} ms</p>
         <p><strong>Query Category:</strong> {result.get('query_category', 'n/a')}</p>
+        <p><strong>Selected Plan:</strong> {result.get('selected_plan_id', 'n/a')}</p>
+        <p><strong>Planner Cache Hit:</strong> {'yes' if result.get('planner_used_cache') else 'no'}</p>
+        <p><strong>Estimated Latency/Quality:</strong> {result.get('estimated_latency_ms', 'n/a')} ms / {result.get('estimated_quality', 'n/a')}</p>
         
         <div class="metric-grid">
         """
@@ -251,6 +406,26 @@ def _generate_detailed_results(results: List[Dict[Any, Any]], active_metrics: se
         
         # Add chunks info if available
         chunks_info = result.get('chunks_info', [])
+        pareto_frontier = result.get('pareto_frontier', [])
+        if pareto_frontier:
+            html += """
+        <details>
+            <summary>Optimizer Frontier</summary>
+            <div style="margin-top: 10px;">
+            """
+            for candidate in pareto_frontier:
+                html += f"""
+                <div class="chunk-item">
+                    <strong>{candidate.get('plan_id', 'n/a')}</strong> |
+                    Predicted latency: {candidate.get('predicted_latency_ms', 'n/a')} ms |
+                    Predicted quality: {candidate.get('predicted_quality', 'n/a')} |
+                    Within budget: {candidate.get('within_budget', False)}
+                </div>
+                """
+            html += """
+            </div>
+        </details>
+        """
         if chunks_info:
             hyde_query = result.get('hyde_query')
             
