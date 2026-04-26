@@ -5,6 +5,7 @@ import pytest
 
 from src.config import RAGConfig
 from src.main import build_query_planner, get_answer, resolve_query_config
+from src.planning.cost_based import AdaptiveQueryPlanner, CostBasedQueryPlanner
 from src.planning.heuristics import HeuristicQueryPlanner
 
 
@@ -57,6 +58,80 @@ def test_resolve_query_config_returns_planner_metadata():
     assert planner_info["query_category"] == "analytical"
     assert planner_info["planner_config_diff"]
     assert effective_cfg.use_hyde is True
+
+
+def test_build_query_planner_supports_cost_based_and_adaptive_modes():
+    assert isinstance(build_query_planner(RAGConfig(planner_mode="cost_based")), CostBasedQueryPlanner)
+    assert isinstance(build_query_planner(RAGConfig(planner_mode="adaptive")), AdaptiveQueryPlanner)
+
+
+def test_cost_based_planner_selects_pareto_plan_within_budget():
+    cfg = RAGConfig(
+        planner_mode="cost_based",
+        latency_budget_ms=950,
+        top_k=5,
+        num_candidates=30,
+        rerank_mode="none",
+    )
+    planner = build_query_planner(cfg)
+
+    effective_cfg, planner_info = resolve_query_config(
+        "Compare OLTP and OLAP workloads in terms of latency and throughput.",
+        cfg,
+        planner,
+    )
+
+    assert planner_info["planner_enabled"] is True
+    assert planner_info["selected_plan_id"]
+    assert planner_info["estimated_latency_ms"] is not None
+    assert planner_info["estimated_quality"] is not None
+    assert planner_info["pareto_frontier"]
+    assert planner_info["planner_used_cache"] is False
+    assert planner_info["query_category"] == "analytical"
+    assert effective_cfg.top_k >= cfg.top_k
+    assert effective_cfg.num_candidates >= effective_cfg.top_k
+    assert any(candidate["within_budget"] for candidate in planner_info["pareto_frontier"])
+
+
+def test_adaptive_planner_reuses_cached_plan_after_positive_feedback():
+    cfg = RAGConfig(
+        planner_mode="adaptive",
+        latency_budget_ms=900,
+        top_k=5,
+        num_candidates=30,
+        planner_cache_quality_threshold=0.7,
+    )
+    planner = build_query_planner(cfg)
+
+    first_query = "Compare OLTP and OLAP workloads."
+    _, first_info = resolve_query_config(first_query, cfg, planner)
+    planner.record_feedback(query=first_query, latency_ms=420.0, quality_signal=0.93)
+
+    second_query = "Compare B+ trees and binary search trees."
+    _, second_info = resolve_query_config(second_query, cfg, planner)
+
+    assert first_info["selected_plan_id"] == second_info["selected_plan_id"]
+    assert second_info["planner_used_cache"] is True
+
+
+def test_adaptive_planner_feedback_updates_snapshot():
+    cfg = RAGConfig(
+        planner_mode="adaptive",
+        latency_budget_ms=800,
+        top_k=5,
+        num_candidates=30,
+    )
+    planner = build_query_planner(cfg)
+    query = "How do I build a B+ tree index?"
+
+    _, planner_info = resolve_query_config(query, cfg, planner)
+    planner.record_feedback(query=query, latency_ms=510.0, quality_signal=0.81)
+    snapshot = planner.snapshot()
+    feedback_key = f"{planner_info['query_category']}:{planner_info['selected_plan_id']}"
+
+    assert feedback_key in snapshot["feedback"]
+    assert snapshot["feedback"][feedback_key]["observations"] == 1
+    assert snapshot["feedback"][feedback_key]["quality_ema"] == pytest.approx(0.81)
 
 
 @patch("src.main.answer", return_value=iter(["planned answer"]))

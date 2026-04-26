@@ -21,13 +21,14 @@ def test_tokensmith_benchmarks(benchmarks, config, results_dir):
     
     # Print test configuration
     print_test_config(config, scorer)
+    runtime = prepare_tokensmith_runtime(config)
     
     # Run each benchmark
     passed = 0
     failed = 0
     
     for benchmark in benchmarks:
-        result = run_benchmark(benchmark, config, results_dir, scorer)
+        result = run_benchmark(benchmark, config, results_dir, scorer, runtime)
         if result["passed"]:
             passed += 1
         else:
@@ -65,7 +66,7 @@ def print_test_config(config, scorer):
     print(f"{'='*60}\n")
 
 
-def run_benchmark(benchmark, config, results_dir, scorer):
+def run_benchmark(benchmark, config, results_dir, scorer, runtime):
     """
     Run a single benchmark test.
     
@@ -93,7 +94,8 @@ def run_benchmark(benchmark, config, results_dir, scorer):
         retrieved_answer, chunks_info, hyde_query, planner_info = get_tokensmith_answer(
             question=question,
             config=config,
-            golden_chunks=golden_chunks if config["use_golden_chunks"] else None
+            golden_chunks=golden_chunks if config["use_golden_chunks"] else None,
+            runtime=runtime,
         )
         latency_ms = round((time.perf_counter() - start) * 1000, 2)
     except Exception as e:
@@ -125,6 +127,10 @@ def run_benchmark(benchmark, config, results_dir, scorer):
     # Check if test passed
     final_score = scores.get("final_score", 0)
     passed = final_score >= threshold
+
+    planner = runtime.get("planner")
+    if planner is not None:
+        planner.record_feedback(query=question, latency_ms=latency_ms, quality_signal=final_score)
     
     # Print result
     print_result(benchmark_id, passed, final_score, threshold, scores, config["output_mode"], retrieved_answer)
@@ -145,8 +151,16 @@ def run_benchmark(benchmark, config, results_dir, scorer):
         "hyde_query": hyde_query if hyde_query else None,
         "latency_ms": latency_ms,
         "planner_mode": config.get("planner_mode", "none"),
+        "planner_name": (planner_info or {}).get("planner_name"),
         "query_category": (planner_info or {}).get("query_category"),
+        "selected_plan_id": (planner_info or {}).get("selected_plan_id"),
+        "planner_used_cache": (planner_info or {}).get("planner_used_cache", False),
+        "estimated_latency_ms": (planner_info or {}).get("estimated_latency_ms"),
+        "estimated_quality": (planner_info or {}).get("estimated_quality"),
+        "latency_budget_ms": (planner_info or {}).get("latency_budget_ms"),
+        "pareto_frontier": (planner_info or {}).get("pareto_frontier", []),
         "planner_info": planner_info or {},
+        "planner_snapshot": planner.snapshot() if planner is not None and hasattr(planner, "snapshot") else {},
         "timestamp": datetime.now().isoformat(),
         "config": {
             "model_path": config["model_path"],
@@ -155,6 +169,7 @@ def run_benchmark(benchmark, config, results_dir, scorer):
             "system_prompt_mode": config["system_prompt_mode"],
             "disable_chunks": config["disable_chunks"],
             "use_golden_chunks": config["use_golden_chunks"],
+            "latency_budget_ms": config.get("latency_budget_ms"),
         }
     }
     
@@ -169,36 +184,15 @@ def run_benchmark(benchmark, config, results_dir, scorer):
     return result_data
 
 
-def get_tokensmith_answer(question, config, golden_chunks=None):
-    """
-    Get answer from TokenSmith system.
-    
-    Args:
-        question: Question text
-        config: Configuration dict
-        golden_chunks: Optional list of golden chunks to use instead of retrieval
-    
-    Returns:
-        tuple: (Generated answer, chunks_info list, hyde_query)
-    """
-    from src.main import get_answer
-    from src.main import build_query_planner, resolve_query_config
-    from src.instrumentation.logging import get_logger
+def prepare_tokensmith_runtime(config):
+    from src.main import build_query_planner
     from src.config import RAGConfig
     from src.retriever import load_artifacts
-    import argparse
-    
-    # Create a mock args namespace with our config values
-    args = argparse.Namespace(
-        index_prefix=config["index_prefix"],
-        model_path=config.get("model_path"),
-        system_prompt_mode=config.get("system_prompt_mode"),
-    )
 
-    # Create RAGConfig from our test config
     cfg = RAGConfig(
         chunk_mode=config.get("chunk_mode", "recursive_sections"),
         top_k=config.get("top_k", 10),
+        num_candidates=config.get("num_candidates", config.get("pool_size", 60)),
         embed_model=config.get("embed_model"),
         ensemble_method=config.get("ensemble_method", config.get("retrieval_method", "rrf")),
         rrf_k=config.get("rrf_k", 60),
@@ -214,10 +208,61 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
         use_hyde=config.get("use_hyde", False),
         hyde_max_tokens=config.get("hyde_max_tokens", 300),
         planner_mode=config.get("planner_mode", "none"),
+        latency_budget_ms=config.get("latency_budget_ms", 900),
+        planner_feedback_alpha=config.get("planner_feedback_alpha", 0.35),
+        planner_cache_max_entries=config.get("planner_cache_max_entries", 64),
+        planner_cache_quality_threshold=config.get("planner_cache_quality_threshold", 0.7),
         use_indexed_chunks=config.get("use_indexed_chunks", False),
         extracted_index_path=config.get("extracted_index_path", "data/extracted_index.json"),
         page_to_chunk_map_path=config.get("page_to_chunk_map_path", "index/sections/textbook_index_page_to_chunk_map.json"),
     )
+    planner = build_query_planner(cfg)
+    artifacts_dir = cfg.get_artifacts_directory()
+    faiss_index, bm25_index, chunks, sources, metadata = load_artifacts(
+        artifacts_dir=artifacts_dir,
+        index_prefix=config["index_prefix"]
+    )
+
+    return {
+        "cfg": cfg,
+        "planner": planner,
+        "artifacts": {
+            "faiss_index": faiss_index,
+            "bm25_index": bm25_index,
+            "chunks": chunks,
+            "sources": sources,
+            "meta": metadata,
+            "planner": planner,
+        },
+    }
+
+
+def get_tokensmith_answer(question, config, golden_chunks=None, runtime=None):
+    """
+    Get answer from TokenSmith system.
+    
+    Args:
+        question: Question text
+        config: Configuration dict
+        golden_chunks: Optional list of golden chunks to use instead of retrieval
+    
+    Returns:
+        tuple: (Generated answer, chunks_info list, hyde_query)
+    """
+    from src.main import get_answer
+    from src.main import resolve_query_config
+    from src.instrumentation.logging import get_logger
+    import argparse
+    
+    # Create a mock args namespace with our config values
+    args = argparse.Namespace(
+        index_prefix=config["index_prefix"],
+        model_path=config.get("model_path"),
+        system_prompt_mode=config.get("system_prompt_mode"),
+    )
+
+    runtime = runtime or prepare_tokensmith_runtime(config)
+    cfg = runtime["cfg"]
     
     # Print status
     if golden_chunks and config["use_golden_chunks"]:
@@ -230,25 +275,11 @@ def get_tokensmith_answer(question, config, golden_chunks=None):
         print(f"  🔍 Retrieving chunks...")
     
     logger = get_logger()
-    planner = build_query_planner(cfg)
+    planner = runtime["planner"]
     _, planner_info = resolve_query_config(question, cfg, planner)
 
     # Run the query through the main pipeline
-    artifacts_dir = cfg.get_artifacts_directory()
-    faiss_index, bm25_index, chunks, sources, metadata = load_artifacts(
-        artifacts_dir=artifacts_dir, 
-        index_prefix=config["index_prefix"]
-    )
-    
-    # Package artifacts for reuse
-    artifacts = {
-        "faiss_index": faiss_index,
-        "bm25_index": bm25_index,
-        "chunks": chunks,
-        "sources": sources,
-        "meta": metadata,
-        "planner": planner,
-    }
+    artifacts = runtime["artifacts"]
 
     result = get_answer(
         question=question,

@@ -146,7 +146,8 @@ def config(pytestconfig):
     merged_config = {
         # Retrieval        
         "top_k": cfg.get("top_k", 10),
-        "pool_size": cfg.get("pool_size", 60),
+        "pool_size": cfg.get("pool_size", cfg.get("num_candidates", 60)),
+        "num_candidates": cfg.get("num_candidates", cfg.get("pool_size", 60)),
         "ensemble_method": cfg.get("ensemble_method", "rrf"),
         "rrf_k": cfg.get("rrf_k", 60),
         "ranker_weights": cfg.get("ranker_weights", {"faiss":0.6,"bm25":0.4}),
@@ -178,6 +179,10 @@ def config(pytestconfig):
         "use_hyde": cfg.get("use_hyde", False),
         "hyde_max_tokens": cfg.get("hyde_max_tokens", 300),
         "planner_mode": cfg.get("planner_mode", "none"),
+        "latency_budget_ms": cfg.get("latency_budget_ms", 900),
+        "planner_feedback_alpha": cfg.get("planner_feedback_alpha", 0.35),
+        "planner_cache_max_entries": cfg.get("planner_cache_max_entries", 64),
+        "planner_cache_quality_threshold": cfg.get("planner_cache_quality_threshold", 0.7),
     }
 
     # Handle enable/disable chunks
